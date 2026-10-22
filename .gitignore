@@ -1,0 +1,7 @@
+bin/
+obj/
+publish/
+TestResults/
+*.user
+.vs/
+__pycache__/

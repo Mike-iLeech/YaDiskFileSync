@@ -1,0 +1,72 @@
+# Тесты и сборка EXE на каждый PR; публикация релиза по тегу vX.Y.Z.
+# Автообновление в приложении берёт последний релиз отсюда, поэтому выпуск =
+#   1) поднять <Version> в YaDiskFileSync.csproj и дописать CHANGELOG.md;
+#   2) git tag v1.1.0 && git push origin v1.1.0
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Версия в csproj совпадает с тегом
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v", "V")
+          $ver = ([xml](Get-Content YaDiskFileSync.csproj)).Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
+          if ($ver -ne $tag) { throw "YaDiskFileSync.csproj = $ver, а тег = $tag" }
+
+      - name: Тесты
+        run: dotnet test tests/YaDiskFileSync.Tests.csproj -c Release
+
+      - name: Сборка EXE
+        run: dotnet publish YaDiskFileSync.csproj -c Release -o publish
+
+      - name: EXE как артефакт (PR)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: YaDiskFileSync-pr${{ github.event.number }}
+          path: publish/YaDiskFileSync.exe
+          retention-days: 14
+
+      - name: Публикация релиза
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $ver = $tag.TrimStart("v", "V")
+          # раздел CHANGELOG.md этой версии — в описание релиза
+          $log = Get-Content CHANGELOG.md -Raw -Encoding utf8
+          $m = [regex]::Match($log, "(?ms)^## \[?$([regex]::Escape($ver))\]?(?=\s)[^\n]*\n(.*?)(?=^## |\z)")
+          $notes = if ($m.Success) { $m.Groups[1].Value.Trim() } else { "YaDisk File Sync $ver" }
+          Set-Content notes.md $notes -Encoding utf8
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag publish/YaDiskFileSync.exe --clobber
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            gh release edit $tag --notes-file notes.md
+          } else {
+            gh release create $tag publish/YaDiskFileSync.exe --title "YaDisk File Sync $ver" --notes-file notes.md
+          }
