@@ -133,6 +133,13 @@ internal static class Planner
             return;
         }
 
+        // Диск показал файл без sha256, но нужного размера — считаем загрузку применённой, иначе ожидание не снимется никогда
+        if (b?.PendingUntil != null && l != null && r != null && r.Sha256 == null && r.Size == b.Size && !lChanged)
+        {
+            ops.Add(new SyncOp(OpKind.Record, rel, false, "загрузка подтверждена") { Local = l, Remote = r });
+            return;
+        }
+
         bool rChanged = r != null && (b == null || RemoteDiffers(r, b, now));
 
         if (l != null && r != null)

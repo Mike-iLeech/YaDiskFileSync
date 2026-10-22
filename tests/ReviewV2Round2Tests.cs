@@ -198,6 +198,43 @@ public class ReviewV2Round2Tests : IDisposable
         Assert.Empty(_disk.Trash);
     }
 
+    // ---------- раунд 3, M-1: вопрос только про то, что действительно удалится ----------
+
+    [Fact]
+    public async Task R3M1_FilteredDeletions_NoEndlessQuestion()
+    {
+        Local("J/a.txt", "1");
+        Local("J/b.txt", "2");
+        Local("J/c.txt", "3");
+        Local("x.txt", "4");
+        var e = Engine();
+        await Synced(e);
+        await Synced(e);
+        string elsewhere = Path.Combine(_tmp, "elsewhere");
+        Directory.CreateDirectory(elsewhere);
+        Directory.Delete(P("J"), true);
+        var mk = Process.Start(new ProcessStartInfo("cmd.exe", $"/c mklink /J \"{P("J")}\" \"{elsewhere}\"")
+            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true })!;
+        mk.WaitForExit();
+        await Synced(e);   // удалять нечего — значит, и спрашивать не о чем
+        await Synced(e);
+        Assert.Null(e.Question);
+        Assert.Empty(_disk.Trash);
+    }
+
+    // ---------- раунд 3, L-1: Диск не прислал sha256 ----------
+
+    [Fact]
+    public void R3L1_PendingWithoutRemoteSha_SameSize_Confirmed()
+    {
+        var plan = Planner.Plan(PendingBase(null, T0.AddMinutes(10)), L(),
+            new Dictionary<string, RemoteItem>(Planner.Paths) { ["f"] = new RemoteItem("f", false, 1, null, T0) }, T0);
+        Assert.Equal(OpKind.Record, Assert.Single(plan.Ops).Kind);
+    }
+
+    [Fact]
+    public void R3M2_SettleWindowShort() => Assert.True(SyncEngine.UploadSettle <= TimeSpan.FromMinutes(3));
+
     // ---------- L-3: Excel посреди сохранения ----------
 
     [Fact]

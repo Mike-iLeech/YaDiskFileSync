@@ -46,7 +46,7 @@ internal sealed class SyncEngine : IDisposable
     /// <summary>Сколько таких незавершённых проходов подряд терпим, прежде чем считать это ошибкой и уйти в паузы Backoff.</summary>
     internal const int MaxAgain = 3;
     /// <summary>Сколько после загрузки ждём, пока Диск применит файл (ответ 202).</summary>
-    internal static readonly TimeSpan UploadSettle = TimeSpan.FromMinutes(10);
+    internal static readonly TimeSpan UploadSettle = TimeSpan.FromMinutes(3);
 
     private readonly Func<IDisk?> _disk;
     private readonly Settings _settings;
@@ -263,15 +263,18 @@ internal sealed class SyncEngine : IDisposable
                 ops.Add(o);
             }
 
-            if (plan.NeedsConfirmation(remoteMissing))
+            // спрашиваем только про то, что действительно будет удалено (без отложенного и пропущенного выше),
+            // иначе вопрос повторялся бы каждый опрос, хотя «Да» ничего не удаляет
+            var toRun = new SyncPlan(ops, plan.BaseFiles);
+            if (toRun.NeedsConfirmation(remoteMissing))
             {
                 IReadOnlySet<string>? allowed;
                 lock (_gate) allowed = _allowedDeletes;
-                var keys = plan.DeletionKeys;
+                var keys = toRun.DeletionKeys;
                 if (allowed == null || !keys.IsSubsetOf(allowed))
                 {
-                    var samples = plan.Ops.Where(o => o.Kind is OpKind.DeleteLocal or OpKind.DeleteRemote && !o.IsDir).Select(o => o.Rel).Take(10).ToList();
-                    Question = new DeletionQuestion(plan.LocalDeletes, plan.RemoteDeletes, plan.BaseFiles, remoteMissing, samples, keys);
+                    var samples = ops.Where(o => o.Kind is OpKind.DeleteLocal or OpKind.DeleteRemote && !o.IsDir).Select(o => o.Rel).Take(10).ToList();
+                    Question = new DeletionQuestion(toRun.LocalDeletes, toRun.RemoteDeletes, toRun.BaseFiles, remoteMissing, samples, keys);
                     SetActivity(new List<Activity>(), baseState);
                     return Say(SyncState.NeedsConfirm, Explain(Question));
                 }
