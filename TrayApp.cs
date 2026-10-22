@@ -46,7 +46,7 @@ internal sealed class TrayApp : IDisposable
         // ClientID есть, а токенов нет — значит, вход был в версии 1.x с правами только на папку приложения
         _needsNewRights = !_secrets.SignedIn && !string.IsNullOrEmpty(_settings.ClientId);
         _tokens = new TokenSource(_secrets, OAuth, SaveSecrets);
-        _engine = new SyncEngine(() => _secrets.SignedIn ? Disk() : null, _settings, SaveSettings,
+        _engine = new SyncEngine(() => _secrets.SignedIn ? new DiskClient(_transfer, new PinnedTokens(_tokens, _secrets)) : null, _settings, SaveSettings,
             new StateStore(StateStore.DefaultFile), new RecycleBin());
         _engine.StatusChanged += s => _ui.Post(_ => Show(s), null);
 
@@ -210,8 +210,8 @@ internal sealed class TrayApp : IDisposable
                 "\nНет — вернуть файлы: скопировать обратно туда, где они пропали." +
                 "\nОтмена — решить позже (синхронизация остаётся на паузе).",
                 "YaDisk File Sync — пропали файлы", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
-            if (answer == DialogResult.Yes) _engine.Resolve(delete: true);
-            else if (answer == DialogResult.No) _engine.Resolve(delete: false);
+            if (answer == DialogResult.Yes) _engine.Resolve(q, delete: true);
+            else if (answer == DialogResult.No) _engine.Resolve(q, delete: false);
         }
         finally { _asking = false; }
     }
@@ -219,45 +219,48 @@ internal sealed class TrayApp : IDisposable
     private void Login()
     {
         if (_dialog != null) { _dialog.Activate(); return; }
-        using var form = new LoginForm(_http, _settings.ClientId, _secrets.ClientSecret, rightsChanged: _needsNewRights);
+        using var form = new LoginForm(_http, _settings.ClientId, _secrets.ClientSecret, VerifyAsync, rightsChanged: _needsNewRights);
         _dialog = form;
         try
         {
-            if (form.ShowDialog() != DialogResult.OK || form.Token is not { } t) return;
+            if (form.ShowDialog() != DialogResult.OK || form.Token is not { } t || form.User is not { } user) return;
+            // вошли под другой учётной записью — её Диск объединится с этой папкой; без согласия не начинаем
+            if (Configured && _settings.AccountUid is { } oldUid && oldUid != user.Uid && MessageBox.Show(
+                    $"Вы вошли как «{user.Login}», а папка {_settings.LocalRoot} до сих пор синхронизировалась " +
+                    $"с Диском «{_settings.AccountLogin ?? "другой учётной записи"}».\n\n" +
+                    $"Объединить её с папкой {DiskPath.Display(_settings.RemoteRoot!)} на Диске «{user.Login}»? Файлы обеих сторон " +
+                    "окажутся и там, и там; при совпадении имён побеждает более новая версия, а проигравшая уходит в Корзину.",
+                    "YaDisk File Sync — другая учётная запись", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2) != DialogResult.OK) return;
             _settings.ClientId = form.ClientId;
-            _settings.AccountUid = null;   // мог войти другой человек — учётную запись узнаем заново
-            _settings.AccountLogin = null;
             lock (_secrets.Sync)
             {
+                // всё сразу и под замком: проход не увидит новый токен со старой учётной записью
                 _secrets.Generation++;
                 _secrets.ClientSecret = form.ClientSecret.Length > 0 ? form.ClientSecret : null;
                 _secrets.AccessToken = t.AccessToken;
                 _secrets.RefreshToken = t.RefreshToken;
                 _secrets.ExpiresAt = t.ExpiresAt;
                 _secrets.Scope = Secrets.CurrentScope;
+                _settings.AccountUid = user.Uid;
+                _settings.AccountLogin = user.Login;
                 SaveSecrets();
             }
             SaveSettings();
             Balloon("Вход выполнен", Configured ? "Синхронизация продолжается." : "Осталось выбрать папки в настройках.", ToolTipIcon.Info);
-            _ = FetchAccountAsync();
         }
         finally { _dialog = null; }
         if (!Configured) OpenSettings();
         else { Show(Initial()); _engine.Request(); }
     }
 
-    private async Task FetchAccountAsync()
+    /// <summary>Чей это токен и видно ли с ним весь Диск (без прав «Чтение всего Диска» будет 403).</summary>
+    private async Task<DiskUser> VerifyAsync(string token, CancellationToken ct)
     {
-        try
-        {
-            if (await Disk().GetUserAsync(CancellationToken.None) is { } u)
-            {
-                _settings.AccountUid = u.Uid;
-                _settings.AccountLogin = u.Login;
-                SaveSettings();
-            }
-        }
-        catch { /* узнаем при первом проходе */ }
+        var client = new DiskClient(_transfer, new StaticToken(token));
+        var user = await client.GetUserAsync(ct) ?? throw new DiskException("Яндекс.Диск не сообщил учётную запись.", DiskErrorKind.Transient);
+        await client.ListFoldersAsync("disk:/", ct);
+        return user;
     }
 
     /// <summary>Выход: папка и файлы на компьютере остаются, синхронизация просто останавливается.</summary>
@@ -306,7 +309,8 @@ internal sealed class TrayApp : IDisposable
              !string.Equals(DiskPath.Normalize(_settings.RemoteRoot!), c.RemoteRoot, StringComparison.OrdinalIgnoreCase));
         if (foldersChanged && MessageBox.Show(
                 $"Синхронизировать {c.LocalRoot}\nс папкой Диска {DiskPath.Display(c.RemoteRoot)}?\n\n" +
-                "Содержимое двух папок будет объединено, при этом ничего не удаляется. Прежняя папка на компьютере останется как есть.",
+                "Содержимое двух папок будет объединено. При совпадении имён побеждает более новая версия, проигравшая уходит " +
+                "в Корзину (Windows или Диска). Прежняя папка на компьютере останется как есть.",
                 "YaDisk File Sync", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
 
         try { Directory.CreateDirectory(c.LocalRoot); }

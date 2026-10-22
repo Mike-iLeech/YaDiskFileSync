@@ -122,7 +122,7 @@ public class DiskApiTests
             .Reply(HttpStatusCode.Created)              // a
             .Reply(HttpStatusCode.Created)              // a/b
             .Reply(HttpStatusCode.Created);             // a/b/c
-        await Client(http).EnsureFolderAsync("/a/b/c", default);
+        await Client(http).EnsureFolderAsync("disk:/a/b/c", default);
         Assert.Equal(5, http.Requests.Count);
         Assert.EndsWith("path=disk%3A%2Fa", http.Requests[2].Url);
         Assert.EndsWith("path=disk%3A%2Fa%2Fb%2Fc", http.Requests[4].Url);
@@ -201,7 +201,8 @@ public class DiskApiTests
     [Fact]
     public void DiskPath_Helpers()
     {
-        Assert.Equal("disk:/A/b.txt", DiskPath.Combine("/A", "b.txt"));
+        Assert.Equal("disk:/A/b.txt", DiskPath.Combine("disk:/A", "b.txt"));
+        Assert.Equal("disk:/A/ b.txt ", DiskPath.Combine("disk:/A", " b.txt "));   // имена файлов — как есть
         Assert.Equal("disk:/A", DiskPath.Parent("disk:/A/B"));
         Assert.Equal("disk:/", DiskPath.Parent("disk:/A"));
         Assert.Null(DiskPath.Parent("disk:/"));

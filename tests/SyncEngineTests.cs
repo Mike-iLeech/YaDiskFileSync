@@ -260,7 +260,7 @@ public class SyncEngineTests : IDisposable
         var e = await FourFilesSynced();
         foreach (var n in new[] { "a", "b", "c" }) File.Delete(P(n + ".txt"));
         await Pass(e);
-        e.Resolve(delete: true);
+        e.Resolve(e.Question!, delete: true);
         await Synced(e);
         Assert.Equal(3, _disk.Trash.Count);
         Assert.True(_disk.Has(D("d.txt")));
@@ -272,7 +272,7 @@ public class SyncEngineTests : IDisposable
         var e = await FourFilesSynced();
         foreach (var n in new[] { "a", "b", "c" }) File.Delete(P(n + ".txt"));
         await Pass(e);
-        e.Resolve(delete: false);
+        e.Resolve(e.Question!, delete: false);
         await Synced(e);
         Assert.Empty(_disk.Trash);
         Assert.Equal("a", LocalText("a.txt"));
@@ -285,7 +285,7 @@ public class SyncEngineTests : IDisposable
         var e = await FourFilesSynced();
         foreach (var n in new[] { "a", "b", "c" }) File.Delete(P(n + ".txt"));
         await Pass(e);
-        e.Resolve(delete: true);
+        e.Resolve(e.Question!, delete: true);
         File.Delete(P("d.txt"));   // пока думали, пропал ещё один — согласие было не на это
         Assert.Equal(SyncState.NeedsConfirm, (await Pass(e)).State);
         Assert.Empty(_disk.Trash);
@@ -300,7 +300,7 @@ public class SyncEngineTests : IDisposable
         Assert.Equal(SyncState.NeedsConfirm, s.State);
         Assert.True(e.Question!.RemoteRootMissing);
         Assert.Empty(_trash.Recycled);
-        e.Resolve(delete: false);
+        e.Resolve(e.Question!, delete: false);
         await Synced(e);
         Assert.Equal("a", _disk.Text(D("a.txt")));
         Assert.Empty(_trash.Recycled);
@@ -377,7 +377,7 @@ public class SyncEngineTests : IDisposable
     public async Task OfficeTempAndService_NotSynced()
     {
         Local("~$Книга.xlsx", "lock");
-        Local("A1B2C3D4", "excel temp");
+        Local("A1B2C3D4", "excel temp", DateTime.UtcNow);
         Local("x.tmp", "tmp");
         Local("Книга.txt", "ok");
         await Synced(Engine());

@@ -88,13 +88,17 @@ internal static class LocalScan
 {
     internal sealed record Result(Dictionary<string, LocalItem> Items, Dictionary<string, string> Busy);
 
+    /// <summary>Сколько файл с именем как у временного файла Excel считается временным.</summary>
+    internal static readonly TimeSpan ExcelTempAge = TimeSpan.FromMinutes(2);
+
     /// <summary>
     /// Все файлы и папки под root, кроме исключённых. SHA-256 считается только у новых и изменившихся
     /// (размер или время не совпали с базой). Файл, который сейчас не прочитать (Excel ещё пишет), попадает
     /// в Busy — с ним в этом проходе ничего не делаем, но и удалённым его не считаем.
     /// </summary>
-    public static Result Scan(string root, IReadOnlyDictionary<string, BaseEntry> baseState, CancellationToken ct)
+    public static Result Scan(string root, IReadOnlyDictionary<string, BaseEntry> baseState, CancellationToken ct, DateTime? nowUtc = null)
     {
+        DateTime now = nowUtc ?? DateTime.UtcNow;
         var items = new Dictionary<string, LocalItem>(Planner.Paths);
         var busy = new Dictionary<string, string>(Planner.Paths);
         var stack = new Stack<(string Dir, string Rel)>();
@@ -119,7 +123,9 @@ internal static class LocalScan
                 long size = fi.Length;
                 DateTime mtime = fi.LastWriteTimeUtc;
                 string? sha = null;
-                if (baseState.TryGetValue(rel, out var b) && !b.IsDir && b.Size == size && b.LocalMtime == mtime)
+                if (Ignore.LooksLikeExcelTemp(info.Name) && now - mtime < ExcelTempAge)
+                    busy[rel] = "временный файл Excel — подожду";   // скорее всего, его сейчас переименуют в книгу
+                else if (baseState.TryGetValue(rel, out var b) && !b.IsDir && b.Size == size && b.LocalMtime == mtime)
                     sha = b.Sha256;   // не менялся с последней синхронизации
                 else
                 {

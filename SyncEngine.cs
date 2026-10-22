@@ -41,6 +41,12 @@ internal sealed class SyncEngine : IDisposable
     {
         TimeSpan.FromSeconds(30), TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(15),
     };
+    /// <summary>Проход не завершился (файл поменялся по ходу) — следующий через эту паузу, а не сразу.</summary>
+    internal static TimeSpan SoonDelay { get; set; } = TimeSpan.FromSeconds(3);
+    /// <summary>Сколько таких незавершённых проходов подряд терпим, прежде чем считать это ошибкой и уйти в паузы Backoff.</summary>
+    internal const int MaxAgain = 3;
+    /// <summary>Сколько после загрузки ждём, пока Диск применит файл (ответ 202).</summary>
+    internal static readonly TimeSpan UploadSettle = TimeSpan.FromMinutes(10);
 
     private readonly Func<IDisk?> _disk;
     private readonly Settings _settings;
@@ -55,6 +61,8 @@ internal sealed class SyncEngine : IDisposable
     private bool _dirty;
     private Task? _loop;
     private CancellationTokenSource? _retry;   // отложенный повтор — всегда не больше одного
+    private bool _soon;                        // проход просит следующий через SoonDelay
+    private int _againStreak;
 
     // решение пользователя о массовом удалении: какие удаления разрешены / какие файлы вернуть
     private IReadOnlySet<string>? _allowedDeletes;
@@ -91,16 +99,18 @@ internal sealed class SyncEngine : IDisposable
         _wake.Release();
     }
 
-    /// <summary>Ответ на вопрос о массовом удалении: true — удалить, false — вернуть файлы на ту сторону, где пропали.</summary>
-    public void Resolve(bool delete)
+    /// <summary>
+    /// Ответ на показанный вопрос о массовом удалении: true — удалить, false — вернуть файлы туда, где пропали.
+    /// Ответ относится ровно к показанным удалениям: если с тех пор пропало что-то ещё, вопрос будет задан снова.
+    /// </summary>
+    public void Resolve(DeletionQuestion q, bool delete)
     {
-        if (Question is not { } q) return;
         lock (_gate)
         {
             if (delete) _allowedDeletes = q.Keys;
             else _restore = q.Keys;
         }
-        Question = null;
+        if (ReferenceEquals(Question, q)) Question = null;
         Request();
     }
 
@@ -121,6 +131,7 @@ internal sealed class SyncEngine : IDisposable
             _retry?.Cancel();
             _retry?.Dispose();
             _retry = null;
+            _soon = false;
             SyncStatus result;
             try { result = await RunOnceAsync(ct); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
@@ -141,6 +152,11 @@ internal sealed class SyncEngine : IDisposable
             {
                 failures = 0;
                 Publish(result);
+                if (_soon)
+                {
+                    _retry = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    _ = RetryLaterAsync(SoonDelay, _retry.Token);
+                }
             }
         }
     }
@@ -157,9 +173,13 @@ internal sealed class SyncEngine : IDisposable
     /// <summary>Один проход синхронизации. Возвращает итоговое состояние (не публикует его).</summary>
     internal async Task<SyncStatus> RunOnceAsync(CancellationToken ct)
     {
+        _soon = false;
         string? localRoot = _settings.LocalRoot, remoteRoot = _settings.RemoteRoot;
         if (string.IsNullOrEmpty(localRoot) || string.IsNullOrEmpty(remoteRoot) || DiskPath.IsRoot(remoteRoot))
             return Say(SyncState.NotConfigured, "Папки не настроены.");
+        remoteRoot = DiskPath.Normalize(remoteRoot);
+        // клиент Диска привязан к текущему входу: если пользователь перезайдёт посреди прохода, запросы
+        // с новым токеном по плану, построенному для старой учётной записи, не уйдут
         if (_disk() is not { } disk)
             return Say(SyncState.NeedLogin, "Войдите в Яндекс.");
 
@@ -190,11 +210,24 @@ internal sealed class SyncEngine : IDisposable
             var remoteList = await disk.ListTreeAsync(remoteRoot, ct);
             bool remoteMissing = remoteList == null;
             var remote = new Dictionary<string, RemoteItem>(Planner.Paths);
-            var dupes = new List<string>();
+            // что лежит на Диске, но не синхронизируется: такие пути не трогаем и папки с ними целиком не удаляем
+            var skipped = new Dictionary<string, string>(Planner.Paths);
+            var unsynced = new List<string>();
             foreach (var r in remoteList ?? Array.Empty<RemoteItem>())
             {
-                if (Ignore.Rel(r.Rel)) continue;
-                if (!remote.TryAdd(r.Rel, r)) dupes.Add(r.Rel);   // «Отчёт.xlsx» и «отчёт.xlsx» — Windows так не умеет
+                if (Ignore.Rel(r.Rel)) { unsynced.Add(r.Rel); continue; }
+                if (Ignore.WindowsCannot(r.Rel))
+                {
+                    unsynced.Add(r.Rel);
+                    skipped[r.Rel] = "имя недопустимо в Windows (запрещённые символы или пробел/точка в конце) — не скачан";
+                    continue;
+                }
+                if (!remote.TryAdd(r.Rel, r))
+                {
+                    // «Отчёт.xlsx» и «отчёт.xlsx» — Windows так не умеет
+                    unsynced.Add(r.Rel);
+                    skipped[r.Rel] = "на Диске есть файлы, чьи имена отличаются только регистром букв";
+                }
             }
 
             LocalScan.Result scan;
@@ -203,8 +236,20 @@ internal sealed class SyncEngine : IDisposable
             { return Say(SyncState.Retrying, "Не удалось прочитать папку: " + e.Message); }
 
             var plan = Planner.Plan(baseState, scan.Items, remote);
-            // с занятыми файлами в этом проходе ничего не делаем
-            var ops = plan.Ops.Where(o => !scan.Busy.ContainsKey(o.Rel) && !dupes.Contains(o.Rel, Planner.Paths)).ToList();
+            var ops = new List<SyncOp>();
+            foreach (var o in plan.Ops)
+            {
+                // с занятыми и пропущенными файлами в этом проходе ничего не делаем
+                if (scan.Busy.ContainsKey(o.Rel) || skipped.ContainsKey(o.Rel)) continue;
+                // папку на Диске с несинхронизируемым содержимым целиком в Корзину не отправляем — только забываем
+                if (o.Kind == OpKind.DeleteRemote && o.IsDir &&
+                    unsynced.Any(u => u.StartsWith(o.Rel + "/", StringComparison.OrdinalIgnoreCase)))
+                {
+                    ops.Add(new SyncOp(OpKind.Forget, o.Rel, true, "в папке на Диске есть несинхронизируемые файлы — оставлена"));
+                    continue;
+                }
+                ops.Add(o);
+            }
 
             if (plan.NeedsConfirmation(remoteMissing))
             {
@@ -213,7 +258,7 @@ internal sealed class SyncEngine : IDisposable
                 var keys = plan.DeletionKeys;
                 if (allowed == null || !keys.IsSubsetOf(allowed))
                 {
-                    var samples = ops.Where(o => o.Kind is OpKind.DeleteLocal or OpKind.DeleteRemote && !o.IsDir).Select(o => o.Rel).Take(10).ToList();
+                    var samples = plan.Ops.Where(o => o.Kind is OpKind.DeleteLocal or OpKind.DeleteRemote && !o.IsDir).Select(o => o.Rel).Take(10).ToList();
                     Question = new DeletionQuestion(plan.LocalDeletes, plan.RemoteDeletes, plan.BaseFiles, remoteMissing, samples, keys);
                     SetActivity(new List<Activity>(), baseState);
                     return Say(SyncState.NeedsConfirm, Explain(Question));
@@ -222,7 +267,7 @@ internal sealed class SyncEngine : IDisposable
             lock (_gate) _allowedDeletes = null;
             Question = null;
 
-            return await ExecuteAsync(disk, key, localRoot, remoteRoot, remoteMissing, remote, baseState, ops, scan.Busy, dupes, ct);
+            return await ExecuteAsync(disk, key, localRoot, remoteRoot, remoteMissing, remote, baseState, ops, scan.Busy, skipped, ct);
         }
         catch (DiskException e)
         {
@@ -256,9 +301,31 @@ internal sealed class SyncEngine : IDisposable
         _store.Save(key, baseState);
     }
 
+    /// <summary>Состояние одного прохода: как на самом деле называются пути на Диске и какие папки решили оставить.</summary>
+    private sealed class PassContext(string localRoot, string remoteRoot, IEnumerable<RemoteItem> remote)
+    {
+        public string LocalRoot { get; } = localRoot;
+        public string RemoteRoot { get; } = remoteRoot;
+        // Диск различает регистр букв, Windows — нет: путь на Диске строим из настоящих имён, что там уже есть
+        private readonly Dictionary<string, string> _remoteNames = remote.ToDictionary(r => r.Rel, r => r.Rel, Planner.Paths);
+        public HashSet<string> KnownRemoteDirs { get; } = new(remote.Where(r => r.IsDir).Select(r => r.Rel), Planner.Paths) { "" };
+        public HashSet<string> KeptLocalDirs { get; } = new(Planner.Paths);
+
+        public string RemoteRel(string rel)
+        {
+            if (_remoteNames.TryGetValue(rel, out var actual)) return actual;
+            int slash = rel.LastIndexOf('/');
+            return slash < 0 ? rel : RemoteRel(rel[..slash]) + rel[slash..];
+        }
+
+        public string RemotePath(string rel) => DiskPath.Combine(RemoteRoot, RemoteRel(rel));
+        public void Created(string rel) => _remoteNames[rel] = RemoteRel(rel);
+        public string LocalPath(string rel) => Path.Combine(LocalRoot, rel.Replace('/', '\\'));
+    }
+
     private async Task<SyncStatus> ExecuteAsync(IDisk disk, string key, string localRoot, string remoteRoot, bool remoteMissing,
         Dictionary<string, RemoteItem> remote, Dictionary<string, BaseEntry> baseState, List<SyncOp> ops,
-        IReadOnlyDictionary<string, string> busy, List<string> dupes, CancellationToken ct)
+        IReadOnlyDictionary<string, string> busy, IReadOnlyDictionary<string, string> skippedRemote, CancellationToken ct)
     {
         // порядок: папки (сверху вниз) → передачи → удаление файлов → удаление папок (снизу вверх)
         static int Rank(SyncOp o) => o.Kind switch
@@ -274,22 +341,18 @@ internal sealed class SyncEngine : IDisposable
                       .Select(o => new Activity(o.Rel, o.Kind, o.IsDir ? 0 : o.Kind == OpKind.Download ? o.Remote?.Size ?? 0 : o.Local?.Size ?? 0))
                       .ToList();
         foreach (var (rel, why) in busy) acts.Add(new Activity(rel, OpKind.Skip, 0) { State = RowState.Failed, Error = why });
-        foreach (string rel in dupes) acts.Add(new Activity(rel, OpKind.Skip, 0)
-            { State = RowState.Failed, Error = "на Диске есть файлы, чьи имена отличаются только регистром букв" });
+        foreach (var (rel, why) in skippedRemote) acts.Add(new Activity(rel, OpKind.Skip, 0) { State = RowState.Failed, Error = why });
         SetActivity(acts, baseState);
         var actByOp = new Dictionary<SyncOp, Activity>();
         int ai = 0;
         foreach (var o in ops) if (o.Kind is not (OpKind.Record or OpKind.Forget)) actByOp[o] = acts[ai++];
 
-        var knownRemoteDirs = new HashSet<string>(remote.Values.Where(r => r.IsDir).Select(r => r.Rel), Planner.Paths) { "" };
-        if (remoteMissing)
-        {
-            await disk.EnsureFolderAsync(remoteRoot, ct);
-        }
+        var pass = new PassContext(localRoot, remoteRoot, remote.Values);
+        if (remoteMissing) await disk.EnsureFolderAsync(remoteRoot, ct);
 
-        int failed = 0, retry = busy.Count;
+        int failed = 0, retry = busy.Count(b => !b.Value.StartsWith("временный файл Excel"));
         bool again = false;
-        string? firstError = null;
+        string? firstError = null, firstAgain = null;
         int sinceSave = 0;
         int transferred = ops.Count(o => o.Kind is OpKind.Upload or OpKind.Download);
         int done = 0;
@@ -304,12 +367,12 @@ internal sealed class SyncEngine : IDisposable
                     Publish(Say(SyncState.Syncing, $"Синхронизирую {++done} из {transferred}: {Path.GetFileName(op.Rel)}"));
                 try
                 {
-                    var outcome = await RunOpAsync(disk, op, act, localRoot, remoteRoot, baseState, knownRemoteDirs, ct);
-                    if (outcome == Outcome.Changed) again = true;
+                    var outcome = await RunOpAsync(disk, op, act, pass, baseState, ct);
+                    if (outcome == Outcome.Changed) { again = true; firstAgain ??= op.Rel; }
                     if (act != null)
                     {
                         act.State = outcome == Outcome.Changed ? RowState.Queued : RowState.Done;
-                        if (outcome == Outcome.Changed) act.Error = "файл изменился во время синхронизации — повторю";
+                        if (outcome == Outcome.Changed) act.Error = "изменился во время синхронизации — повторю";
                     }
                 }
                 catch (DiskException e) when (e.Kind == DiskErrorKind.Fatal)
@@ -322,6 +385,7 @@ internal sealed class SyncEngine : IDisposable
                 {
                     // на Диске файла уже нет (удалили, пока шёл проход) — разберёмся в следующем проходе
                     again = true;
+                    firstAgain ??= op.Rel;
                     if (act != null) { act.State = RowState.Queued; act.Error = e.Message; }
                 }
                 catch (Exception e) when (e is IOException or UnauthorizedAccessException)
@@ -345,17 +409,27 @@ internal sealed class SyncEngine : IDisposable
             SetActivity(acts, baseState);
         }
 
-        int skipped = ops.Count(o => o.Kind == OpKind.Skip);
-        if (again) Request();
+        if (again)
+        {
+            // не «синхронизировано», пока остались незавершённые действия; и не по кругу без пауз
+            if (++_againStreak > MaxAgain)
+                return Say(SyncState.Retrying, $"Не удаётся завершить синхронизацию «{firstAgain}»: он меняется во время передачи.");
+            _soon = true;
+        }
+        else _againStreak = 0;
+
+        int skipped = ops.Count(o => o.Kind == OpKind.Skip) + skippedRemote.Count;
         if (failed > 0)
             return Say(SyncState.Error, failed == 1 ? "Не синхронизирован файл " + firstError : $"Не синхронизировано файлов: {failed}. {firstError}");
         if (retry > 0)
             return Say(SyncState.Retrying, retry == 1 && firstError != null ? "Не удалось: " + firstError
                 : $"Файлов занято или недоступно: {retry} — повторю позже.");
+        if (again)
+            return Say(SyncState.Pending, "Есть изменения во время синхронизации — продолжаю…");
 
         _settings.LastSyncedAt = _now();
         TrySaveSettings();
-        string note = skipped + dupes.Count > 0 ? $" (пропущено: {skipped + dupes.Count}, см. «Статус синхронизации»)" : "";
+        string note = skipped > 0 ? $" (пропущено: {skipped}, см. «Статус синхронизации»)" : "";
         return new SyncStatus(SyncState.Synced, "Синхронизировано" + note, _settings.LastSyncedAt);
     }
 
@@ -366,11 +440,10 @@ internal sealed class SyncEngine : IDisposable
 
     private enum Outcome { Done, Changed }
 
-    private async Task<Outcome> RunOpAsync(IDisk disk, SyncOp op, Activity? act, string localRoot, string remoteRoot,
-        Dictionary<string, BaseEntry> baseState, HashSet<string> knownRemoteDirs, CancellationToken ct)
+    private async Task<Outcome> RunOpAsync(IDisk disk, SyncOp op, Activity? act, PassContext pass,
+        Dictionary<string, BaseEntry> baseState, CancellationToken ct)
     {
-        string full = Path.Combine(localRoot, op.Rel.Replace('/', '\\'));
-        string remotePath = DiskPath.Combine(remoteRoot, op.Rel);
+        string full = pass.LocalPath(op.Local?.Rel ?? op.Rel);
         switch (op.Kind)
         {
             case OpKind.Record:
@@ -387,43 +460,69 @@ internal sealed class SyncEngine : IDisposable
                 return Outcome.Done;
 
             case OpKind.MkdirLocal:
-                Directory.CreateDirectory(full);
+                Directory.CreateDirectory(pass.LocalPath(op.Remote?.Rel ?? op.Rel));
                 baseState[op.Rel] = new BaseEntry { IsDir = true };
                 return Outcome.Done;
 
             case OpKind.MkdirRemote:
-                await EnsureRemoteDirAsync(disk, remoteRoot, op.Rel, knownRemoteDirs, ct);
+                await EnsureRemoteDirAsync(disk, pass, op.Rel, ct);
                 baseState[op.Rel] = new BaseEntry { IsDir = true };
                 return Outcome.Done;
 
             case OpKind.Upload:
-                return await UploadAsync(disk, op, act, full, remotePath, remoteRoot, baseState, knownRemoteDirs, ct);
+                return await UploadAsync(disk, op, act, full, pass, baseState, ct);
 
             case OpKind.Download:
-                return await DownloadAsync(disk, op, act, full, localRoot, remotePath, baseState, ct);
+                return await DownloadAsync(disk, op, act, pass, baseState, ct);
 
             case OpKind.DeleteRemote:
-                await disk.DeleteAsync(remotePath, ct);
+            {
+                // пока шёл проход, на компьютере появилось то же имя (Excel сохраняет через удаление и переименование) — не удаляем
+                string local = pass.LocalPath(op.Rel);
+                if (File.Exists(local) || Directory.Exists(local)) return Outcome.Changed;
+                await disk.DeleteAsync(pass.RemotePath(op.Rel), ct);
                 baseState.Remove(op.Rel);
                 if (op.IsDir) RemoveUnder(baseState, op.Rel);
                 return Outcome.Done;
+            }
 
             case OpKind.DeleteLocal:
-                if (op.IsDir)
-                {
-                    if (!Directory.Exists(full)) { baseState.Remove(op.Rel); return Outcome.Done; }
-                    // что-то появилось, пока шёл проход — не трогаем, следующий проход это загрузит
-                    if (Directory.EnumerateFileSystemEntries(full).Any(e => !Ignore.Name(Path.GetFileName(e)))) return Outcome.Changed;
-                    _trash.Recycle(full);
-                    baseState.Remove(op.Rel);
-                    return Outcome.Done;
-                }
+                if (op.IsDir) return DeleteLocalDir(op, full, pass, baseState);
                 if (!File.Exists(full)) { baseState.Remove(op.Rel); return Outcome.Done; }
                 if (!SameAsScanned(full, op.Local!)) return Outcome.Changed;
                 _trash.Recycle(full);
                 baseState.Remove(op.Rel);
                 return Outcome.Done;
         }
+        return Outcome.Done;
+    }
+
+    /// <summary>
+    /// Папку, удалённую на Диске, отправляем в Корзину целиком, только если в ней не осталось ничего, кроме
+    /// мусора Проводника. Появилось что-то синхронизируемое — разберёт следующий проход; лежит то, что мы не
+    /// синхронизируем (ссылки, временные файлы, оставленные подпапки), — папку оставляем и забываем.
+    /// </summary>
+    private Outcome DeleteLocalDir(SyncOp op, string full, PassContext pass, Dictionary<string, BaseEntry> baseState)
+    {
+        if (!Directory.Exists(full)) { baseState.Remove(op.Rel); return Outcome.Done; }
+        bool keep = false;
+        foreach (var info in new DirectoryInfo(full).EnumerateFileSystemInfos())
+        {
+            string name = info.Name;
+            if (name.Equals("desktop.ini", StringComparison.OrdinalIgnoreCase) || name.Equals("Thumbs.db", StringComparison.OrdinalIgnoreCase)) continue;
+            bool synced = !Ignore.Name(name) && (info.Attributes & FileAttributes.ReparsePoint) == 0;
+            string childRel = op.Rel + "/" + name;
+            if (synced && !(info is DirectoryInfo && pass.KeptLocalDirs.Contains(childRel))) return Outcome.Changed;
+            keep = true;
+        }
+        if (keep)
+        {
+            pass.KeptLocalDirs.Add(op.Rel);
+            baseState.Remove(op.Rel);
+            return Outcome.Done;
+        }
+        _trash.Recycle(full);
+        baseState.Remove(op.Rel);
         return Outcome.Done;
     }
 
@@ -439,38 +538,51 @@ internal sealed class SyncEngine : IDisposable
         return fi.Exists && fi.Length == l.Size && fi.LastWriteTimeUtc == l.Mtime;
     }
 
-    private static async Task EnsureRemoteDirAsync(IDisk disk, string remoteRoot, string rel, HashSet<string> known, CancellationToken ct)
+    private static async Task EnsureRemoteDirAsync(IDisk disk, PassContext pass, string rel, CancellationToken ct)
     {
-        if (known.Contains(rel)) return;
-        await disk.EnsureFolderAsync(DiskPath.Combine(remoteRoot, rel), ct);
+        if (pass.KnownRemoteDirs.Contains(rel)) return;
+        await disk.EnsureFolderAsync(pass.RemotePath(rel), ct);
         // EnsureFolderAsync создаёт и родителей — запоминаем всю цепочку
-        for (string? r = rel; !string.IsNullOrEmpty(r); r = r.Contains('/') ? r[..r.LastIndexOf('/')] : null) known.Add(r);
+        for (string? r = rel; !string.IsNullOrEmpty(r); r = r.Contains('/') ? r[..r.LastIndexOf('/')] : null)
+        {
+            pass.Created(r);
+            pass.KnownRemoteDirs.Add(r);
+        }
     }
 
-    private async Task<Outcome> UploadAsync(IDisk disk, SyncOp op, Activity? act, string full, string remotePath, string remoteRoot,
-        Dictionary<string, BaseEntry> baseState, HashSet<string> knownRemoteDirs, CancellationToken ct)
+    private async Task<Outcome> UploadAsync(IDisk disk, SyncOp op, Activity? act, string full, PassContext pass,
+        Dictionary<string, BaseEntry> baseState, CancellationToken ct)
     {
         var l = op.Local!;
         int slash = op.Rel.LastIndexOf('/');
-        if (slash > 0) await EnsureRemoteDirAsync(disk, remoteRoot, op.Rel[..slash], knownRemoteDirs, ct);
+        if (slash > 0) await EnsureRemoteDirAsync(disk, pass, op.Rel[..slash], ct);
+        string remotePath = pass.RemotePath(op.Rel);
 
         await using var fs = LocalScan.OpenShared(full);
         if (!SameAsScanned(full, l) || fs.Length != l.Size) return Outcome.Changed;
+        // конфликт, победил компьютер: версию с Диска не затираем, а отправляем в Корзину Диска
+        if (op.ReplacesRemoteChanges && op.Remote != null) await disk.DeleteAsync(remotePath, ct);
         await using var hashing = new HashingStream(fs, reading: true);
         if (act != null) act.Done = 0;
         await disk.UploadAsync(remotePath, hashing, l.Size, n => { if (act != null) Interlocked.Add(ref act.Done, n); }, ct);
         string sent = hashing.Sha256Hex();
+        pass.Created(op.Rel);
         // в базу — то, что реально ушло на Диск (а не то, что лежит в файле сейчас): если файл успели
         // поменять, следующий проход увидит «изменён на компьютере» и загрузит снова
-        baseState[op.Rel] = new BaseEntry { Sha256 = sent, Size = hashing.Count, LocalMtime = l.Mtime, RemoteModified = null };
+        baseState[op.Rel] = new BaseEntry
+        {
+            Sha256 = sent, Size = hashing.Count, LocalMtime = l.Mtime, RemoteModified = null,
+            PrevRemoteSha = op.Remote?.Sha256, PendingUntil = op.Remote?.Sha256 != null ? DateTime.UtcNow + UploadSettle : null,
+        };
         return Planner.SameHash(sent, l.Sha256) && SameAsScanned(full, l) ? Outcome.Done : Outcome.Changed;
     }
 
-    private async Task<Outcome> DownloadAsync(IDisk disk, SyncOp op, Activity? act, string full, string localRoot, string remotePath,
+    private async Task<Outcome> DownloadAsync(IDisk disk, SyncOp op, Activity? act, PassContext pass,
         Dictionary<string, BaseEntry> baseState, CancellationToken ct)
     {
         var r = op.Remote!;
-        string tmpDir = Path.Combine(localRoot, Ignore.ServiceDir, "tmp");
+        string full = pass.LocalPath(op.Local?.Rel ?? r.Rel);
+        string tmpDir = Path.Combine(pass.LocalRoot, Ignore.ServiceDir, "tmp");
         Directory.CreateDirectory(tmpDir);
         string tmp = Path.Combine(tmpDir, Guid.NewGuid().ToString("N"));
         try
@@ -481,7 +593,7 @@ internal sealed class SyncEngine : IDisposable
             await using (var hashing = new HashingStream(fs, reading: false))
             {
                 if (act != null) act.Done = 0;
-                await disk.DownloadAsync(remotePath, hashing, n => { if (act != null) Interlocked.Add(ref act.Done, n); }, ct);
+                await disk.DownloadAsync(DiskPath.Combine(pass.RemoteRoot, r.Rel), hashing, n => { if (act != null) Interlocked.Add(ref act.Done, n); }, ct);
                 await hashing.FlushAsync(ct);
                 got = hashing.Sha256Hex();
                 size = hashing.Count;

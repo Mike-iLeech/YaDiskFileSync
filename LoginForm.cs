@@ -34,12 +34,18 @@ internal sealed class LoginForm : Form
     private CancellationTokenSource? _cts;
 
     public TokenSet? Token { get; private set; }
+    /// <summary>Учётная запись, под которой вошли (проверена запросом к Диску).</summary>
+    public DiskUser? User { get; private set; }
+    private readonly Func<string, CancellationToken, Task<DiskUser>> _verify;
     public string ClientId => _clientId.Text.Trim();
     public string ClientSecret => _secret.Text.Trim();
 
-    public LoginForm(HttpClient http, string? clientId, string? clientSecret, bool rightsChanged = false)
+    /// <param name="verify">Проверка нового токена: чья учётная запись и есть ли доступ ко всему Диску.</param>
+    public LoginForm(HttpClient http, string? clientId, string? clientSecret, Func<string, CancellationToken, Task<DiskUser>> verify,
+        bool rightsChanged = false)
     {
         _http = http;
+        _verify = verify;
         Text = "Вход в Яндекс — YaDisk File Sync";
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = MinimizeBox = false;
@@ -121,7 +127,11 @@ internal sealed class LoginForm : Form
             try { Clipboard.SetText(dc.UserCode); _hint.Text += " Код уже скопирован."; } catch { }
             Open(dc.VerificationUrl);
 
-            Token = await oauth.WaitForTokenAsync(dc, ct);
+            var token = await oauth.WaitForTokenAsync(dc, ct);
+            _code.Visible = _open.Visible = false;
+            _hint.Text = "Проверяю доступ к Диску…";
+            User = await _verify(token.AccessToken, ct);
+            Token = token;
             DialogResult = DialogResult.OK;
             Close();
         }
@@ -129,6 +139,12 @@ internal sealed class LoginForm : Form
         catch (OAuthException e)
         {
             _hint.Text = e.Message;
+            _code.Visible = _open.Visible = false;
+        }
+        catch (DiskException e)
+        {
+            // чаще всего 403: приложению не дали права на весь Диск
+            _hint.Text = "Вход выполнен, но " + char.ToLowerInvariant(e.Message[0]) + e.Message[1..] + " Затем нажмите «Получить код» снова.";
             _code.Visible = _open.Visible = false;
         }
         finally

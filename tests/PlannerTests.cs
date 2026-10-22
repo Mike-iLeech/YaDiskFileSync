@@ -217,7 +217,7 @@ public class PlannerTests
 
     [Theory]
     [InlineData("~$Книга.xlsx", true)]
-    [InlineData("A1B2C3D4", true)]
+    [InlineData("A1B2C3D4", false)]             // как временный файл Excel, но это решает обход по возрасту файла
     [InlineData("Книга.xlsx.tmp", true)]
     [InlineData("desktop.ini", true)]
     [InlineData("Thumbs.db", true)]
@@ -227,6 +227,13 @@ public class PlannerTests
     [InlineData("A1B2C3D4.xlsx", false)]
     [InlineData("Отчёт 2026", false)]
     public void Ignore_Names(string name, bool ignored) => Assert.Equal(ignored, Ignore.Name(name));
+
+    [Theory]
+    [InlineData("A1B2C3D4", true)]
+    [InlineData("20241231", true)]
+    [InlineData("A1B2C3D4.xlsx", false)]
+    [InlineData("A1B2C3D", false)]
+    public void LooksLikeExcelTemp(string name, bool expected) => Assert.Equal(expected, Ignore.LooksLikeExcelTemp(name));
 
     [Fact]
     public void Ignore_ServiceDirAnywhereInPath() => Assert.True(Ignore.Rel(".yadisksync/tmp/abc"));

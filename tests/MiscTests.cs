@@ -15,7 +15,7 @@ public class FolderWatchTests : IDisposable
     [InlineData("Бухгалтерия.xlsx", true)]
     [InlineData(@"Отчёты\квартал.xlsx", true)]
     [InlineData("~$Бухгалтерия.xlsx", false)]   // файл-блокировка Excel
-    [InlineData("A1B2C3D4", false)]             // временный файл сохранения
+    [InlineData("A1B2C3D4", true)]              // временный файл сохранения: событие будит проход, а там решается по возрасту
     [InlineData(@".yadisksync\tmp\abc", false)] // наши же скачивания
     [InlineData(null, false)]
     public void IsRelevant(string? name, bool expected) => Assert.Equal(expected, FolderWatch.IsRelevant(name));

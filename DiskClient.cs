@@ -75,44 +75,54 @@ internal sealed class DiskClient(HttpClient http, ITokenSource tokens) : IDisk
         {
             string rel = queue.Dequeue();
             string folder = rel.Length == 0 ? root : DiskPath.Combine(root, rel);
+            // неполный список опаснее ошибки: всё, чего в нём нет, сочлось бы удалённым на Диске
+            static DiskException Partial(string why) => new("Список файлов на Диске получен не полностью (" + why + ") — повторю.", DiskErrorKind.Transient);
+            int seen = 0;
             for (int offset = 0; ; offset += Page)
             {
                 JsonDocument? doc;
                 try
                 {
-                    doc = await ApiAsync(HttpMethod.Get, $"/resources?path={Esc(folder)}&limit={Page}&offset={offset}" +
-                        "&fields=type,_embedded.items.name,_embedded.items.type,_embedded.items.size," +
+                    doc = await ApiAsync(HttpMethod.Get, $"/resources?path={Esc(folder)}&limit={Page}&offset={offset}&sort=name" +
+                        "&fields=type,_embedded.total,_embedded.items.name,_embedded.items.type,_embedded.items.size," +
                         "_embedded.items.sha256,_embedded.items.modified", ct);
                 }
                 catch (DiskException e) when (e.NotFound)
                 {
                     if (rel.Length == 0) return null;
-                    break;   // подпапку удалили, пока обходили: её содержимое и так пропало
+                    throw Partial("папка изменилась во время обхода");
                 }
                 using (doc)
                 {
-                    if (doc == null) break;
+                    if (doc == null) throw Partial("пустой ответ");
                     if (Str(doc.RootElement, "type") == "file")
                     {
                         if (rel.Length == 0) throw new DiskException($"На Диске «{root}» — файл, а не папка.", DiskErrorKind.Fatal);
-                        break;
+                        throw Partial("папка стала файлом");
                     }
                     if (!doc.RootElement.TryGetProperty("_embedded", out var emb) ||
-                        !emb.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array) break;
+                        !emb.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array) throw Partial("нет списка");
                     int got = 0;
                     foreach (var it in items.EnumerateArray())
                     {
                         got++;
-                        if (Str(it, "name") is not { Length: > 0 } name) continue;
+                        if (Str(it, "name") is not { Length: > 0 } name) throw Partial("элемент без имени");
                         string childRel = rel.Length == 0 ? name : rel + "/" + name;
                         bool dir = Str(it, "type") == "dir";
                         DateTime? mod = it.TryGetProperty("modified", out var m) && m.ValueKind == JsonValueKind.String && m.TryGetDateTime(out var dt)
                             ? dt.ToUniversalTime() : null;
-                        long size = it.TryGetProperty("size", out var s) && s.ValueKind == JsonValueKind.Number ? s.GetInt64() : 0;
+                        long size = it.TryGetProperty("size", out var sz) && sz.ValueKind == JsonValueKind.Number ? sz.GetInt64() : 0;
                         result.Add(new RemoteItem(childRel, dir, dir ? 0 : size, dir ? null : Str(it, "sha256")?.ToUpperInvariant(), mod));
                         if (dir) queue.Enqueue(childRel);
                     }
-                    if (got < Page) break;
+                    seen += got;
+                    if (got < Page)
+                    {
+                        // папка менялась между страницами — сдвиг offset мог пропустить элементы
+                        if (emb.TryGetProperty("total", out var t) && t.ValueKind == JsonValueKind.Number && t.GetInt32() != seen)
+                            throw Partial("папка изменилась во время обхода");
+                        break;
+                    }
                 }
             }
         }
@@ -125,7 +135,7 @@ internal sealed class DiskClient(HttpClient http, ITokenSource tokens) : IDisk
         var names = new List<string>();
         for (int offset = 0; ; offset += Page)
         {
-            using var doc = await ApiAsync(HttpMethod.Get, $"/resources?path={Esc(DiskPath.Normalize(path))}&limit={Page}&offset={offset}" +
+            using var doc = await ApiAsync(HttpMethod.Get, $"/resources?path={Esc(path)}&limit={Page}&offset={offset}" +
                 "&sort=name&fields=_embedded.items.name,_embedded.items.type", ct);
             if (doc == null || !doc.RootElement.TryGetProperty("_embedded", out var emb) ||
                 !emb.TryGetProperty("items", out var items) || items.ValueKind != JsonValueKind.Array) return names;
@@ -141,7 +151,6 @@ internal sealed class DiskClient(HttpClient http, ITokenSource tokens) : IDisk
 
     public async Task EnsureFolderAsync(string path, CancellationToken ct)
     {
-        path = DiskPath.Normalize(path);
         try { await MkdirAsync(path, ct); }
         catch (DiskException e) when (e.InnerException is HttpConflict { ApiError: "DiskPathDoesntExistsError" })
         {
@@ -162,7 +171,7 @@ internal sealed class DiskClient(HttpClient http, ITokenSource tokens) : IDisk
     public async Task UploadAsync(string path, Stream data, long length, Action<long>? progress, CancellationToken ct)
     {
         string href;
-        using (var doc = await ApiAsync(HttpMethod.Get, $"/resources/upload?path={Esc(DiskPath.Normalize(path))}&overwrite=true", ct))
+        using (var doc = await ApiAsync(HttpMethod.Get, $"/resources/upload?path={Esc(path)}&overwrite=true", ct))
             href = doc == null ? "" : Str(doc.RootElement, "href") ?? "";
         var target = TransferUri(href, "загрузки");
 
@@ -180,7 +189,7 @@ internal sealed class DiskClient(HttpClient http, ITokenSource tokens) : IDisk
     public async Task DownloadAsync(string path, Stream target, Action<long>? progress, CancellationToken ct)
     {
         string href;
-        using (var doc = await ApiAsync(HttpMethod.Get, $"/resources/download?path={Esc(DiskPath.Normalize(path))}", ct))
+        using (var doc = await ApiAsync(HttpMethod.Get, $"/resources/download?path={Esc(path)}", ct))
             href = doc == null ? "" : Str(doc.RootElement, "href") ?? "";
         var source = TransferUri(href, "скачивания");
 
@@ -207,7 +216,7 @@ internal sealed class DiskClient(HttpClient http, ITokenSource tokens) : IDisk
     public async Task DeleteAsync(string path, CancellationToken ct)
     {
         // permanently=false — в Корзину Диска, оттуда можно восстановить
-        try { (await ApiAsync(HttpMethod.Delete, $"/resources?path={Esc(DiskPath.Normalize(path))}&permanently=false", ct))?.Dispose(); }
+        try { (await ApiAsync(HttpMethod.Delete, $"/resources?path={Esc(path)}&permanently=false", ct))?.Dispose(); }
         catch (DiskException e) when (e.NotFound) { }
     }
 
@@ -388,7 +397,10 @@ internal sealed class HashingStream(Stream inner, bool reading) : Stream
 /// <summary>Пути на Диске: «disk:/Папка/Подпапка».</summary>
 internal static class DiskPath
 {
-    /// <summary>Приводит «/Папка», «Папка/», «disk:/Папка» к «disk:/Папка»; корень — «disk:/».</summary>
+    /// <summary>
+    /// Путь, введённый человеком (настройки): «/Папка», «Папка/», «disk:/Папка» → «disk:/Папка»; корень — «disk:/».
+    /// Пробелы по краям частей обрезаются — поэтому только для ввода, а не для путей файлов: « a.txt» и «a.txt» — разные файлы.
+    /// </summary>
     public static string Normalize(string path)
     {
         string p = path.Trim().Replace('\\', '/');
@@ -397,18 +409,14 @@ internal static class DiskPath
         return "disk:/" + string.Join('/', parts);
     }
 
-    public static string Combine(string root, string rel)
-    {
-        root = Normalize(root);
-        return root.EndsWith('/') ? root + rel : root + "/" + rel;
-    }
+    /// <summary>Корень (уже нормализованный) + относительный путь как есть, без обрезки пробелов.</summary>
+    public static string Combine(string root, string rel) => root.EndsWith('/') ? root + rel : root + "/" + rel;
 
     public static string? Parent(string path)
     {
-        path = Normalize(path);
+        if (path == "disk:/") return null;
         int i = path.LastIndexOf('/');
-        if (i < "disk:/".Length) return path == "disk:/" ? null : "disk:/";
-        return path[..i];
+        return i < "disk:/".Length ? "disk:/" : path[..i];
     }
 
     /// <summary>Для показа человеку: «/Папка/Подпапка».</summary>
@@ -482,5 +490,34 @@ internal sealed class TokenSource(Secrets secrets, Func<YandexOAuth?> oauth, Act
             }
         }
         finally { _lock.Release(); }
+    }
+}
+
+/// <summary>Один конкретный токен (проверка сразу после входа, до сохранения).</summary>
+internal sealed class StaticToken(string token) : ITokenSource
+{
+    public Task<string> GetAsync(bool force, CancellationToken ct) => force
+        ? throw new DiskException("Яндекс.Диск не принял вход — войдите заново.", DiskErrorKind.Auth)
+        : Task.FromResult(token);
+}
+
+/// <summary>
+/// Токены, привязанные к входу на момент создания: если пользователь вышел или вошёл заново (возможно, под другой
+/// учётной записью), запросы прохода, начатого до этого, не уходят — план строился для прежнего Диска.
+/// </summary>
+internal sealed class PinnedTokens(ITokenSource inner, Secrets secrets) : ITokenSource
+{
+    private readonly int _generation = Generation(secrets);
+
+    private static int Generation(Secrets s)
+    {
+        lock (s.Sync) return s.Generation;
+    }
+
+    public Task<string> GetAsync(bool force, CancellationToken ct)
+    {
+        if (Generation(secrets) != _generation)
+            throw new DiskException("Вход изменился — синхронизация начнётся заново.", DiskErrorKind.Transient);
+        return inner.GetAsync(force, ct);
     }
 }

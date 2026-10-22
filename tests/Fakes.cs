@@ -49,7 +49,7 @@ internal sealed class FixedToken(string token = "T") : ITokenSource
 }
 
 /// <summary>
-/// Яндекс.Диск в памяти: файлы и папки по полным путям «disk:/…» (без учёта регистра, как и Windows),
+/// Яндекс.Диск в памяти: файлы и папки по полным путям «disk:/…» — с учётом регистра и пробелов в именах, как настоящий,
 /// SHA-256 и время изменения, Корзина. Hook — вмешаться в любую операцию (ошибка, правка «с другого устройства»).
 /// </summary>
 internal sealed class FakeDisk : IDisk
@@ -62,7 +62,17 @@ internal sealed class FakeDisk : IDisk
         public bool OmitSha;   // ответ без sha256
     }
 
-    public Dictionary<string, Node> Items { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, Node> Items { get; } = new(StringComparer.Ordinal);
+    /// <summary>Загрузка принята (202), но в списке Диска пока прежняя версия — до ApplyPending().</summary>
+    public bool DelayApply { get; set; }
+    private readonly Dictionary<string, byte[]> _pending = new(StringComparer.Ordinal);
+    public int Lists { get; private set; }
+
+    public void ApplyPending()
+    {
+        foreach (var (p, d) in _pending) Items[p] = new Node { Data = d, Modified = Tick() };
+        _pending.Clear();
+    }
     public List<string> Trash { get; } = new();
     public List<string> Log { get; } = new();
     public DateTime Clock { get; set; } = new(2026, 10, 22, 10, 0, 0, DateTimeKind.Utc);
@@ -72,7 +82,8 @@ internal sealed class FakeDisk : IDisk
 
     private DateTime Tick() => Clock = Clock.AddSeconds(1);
 
-    public static string N(string p) => DiskPath.Normalize(p);
+    /// <summary>Полный путь «disk:/…» оставляем как есть (имена с пробелами — настоящие), остальное нормализуем.</summary>
+    public static string N(string p) => p.StartsWith("disk:/", StringComparison.Ordinal) ? p : DiskPath.Normalize(p);
 
     public void PutFile(string path, string content, DateTime? modified = null)
     {
@@ -110,9 +121,10 @@ internal sealed class FakeDisk : IDisk
     {
         root = N(root);
         Check("list", root);
+        Lists++;
         if (!Items.TryGetValue(root, out var r) || !r.IsDir) return Task.FromResult<IReadOnlyList<RemoteItem>?>(null);
         string prefix = root + "/";
-        IReadOnlyList<RemoteItem> list = Items.Where(kv => kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        IReadOnlyList<RemoteItem> list = Items.Where(kv => kv.Key.StartsWith(prefix, StringComparison.Ordinal))
             .Select(kv => new RemoteItem(kv.Key[prefix.Length..], kv.Value.IsDir, kv.Value.IsDir ? 0 : kv.Value.Data.Length,
                 kv.Value.IsDir || kv.Value.OmitSha ? null : Convert.ToHexString(SHA256.HashData(kv.Value.Data)), kv.Value.Modified))
             .ToList();
@@ -143,7 +155,8 @@ internal sealed class FakeDisk : IDisk
             throw new DiskException("Папка на Диске не найдена.", DiskErrorKind.Transient);
         Check("uploaded", path);
         Log.Add("upload " + path);
-        Items[path] = new Node { Data = ms.ToArray(), Modified = Tick() };
+        if (DelayApply) _pending[path] = ms.ToArray();
+        else Items[path] = new Node { Data = ms.ToArray(), Modified = Tick() };
     }
 
     public async Task DownloadAsync(string path, Stream target, Action<long>? progress, CancellationToken ct)
@@ -162,8 +175,8 @@ internal sealed class FakeDisk : IDisk
         path = N(path);
         Check("delete", path);
         Log.Add("delete " + path);
-        foreach (var k in Items.Keys.Where(k => k.Equals(path, StringComparison.OrdinalIgnoreCase) ||
-                                                k.StartsWith(path + "/", StringComparison.OrdinalIgnoreCase)).ToList())
+        foreach (var k in Items.Keys.Where(k => k.Equals(path, StringComparison.Ordinal) ||
+                                                k.StartsWith(path + "/", StringComparison.Ordinal)).ToList())
         {
             Items.Remove(k);
             Trash.Add(k);

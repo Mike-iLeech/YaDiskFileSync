@@ -13,6 +13,12 @@ internal sealed class BaseEntry
     public DateTime LocalMtime { get; set; }
     /// <summary>Время изменения на Диске, если оно было известно.</summary>
     public DateTime? RemoteModified { get; set; }
+    /// <summary>
+    /// Только что загрузили, а Диск мог ответить 202 и применить файл чуть позже: до PendingUntil прежняя версия
+    /// (PrevRemoteSha) в списке Диска — не «изменение на Диске», а ещё не применённая загрузка.
+    /// </summary>
+    public string? PrevRemoteSha { get; set; }
+    public DateTime? PendingUntil { get; set; }
 }
 
 /// <summary>Файл или папка на компьютере. Sha256 у файла посчитан или взят из базы, если файл не менялся.</summary>
@@ -38,9 +44,11 @@ internal enum OpKind
 
 /// <summary>
 /// Действие над путём. ReplacesLocalChanges — скачивание затирает локальные изменения, которых нет на Диске
-/// (конфликт, победил Диск): прежний локальный файл сначала уходит в Корзину Windows.
+/// (конфликт, победил Диск): прежний локальный файл сначала уходит в Корзину Windows. ReplacesRemoteChanges —
+/// наоборот (победил компьютер): версия на Диске сначала уходит в Корзину Диска.
 /// </summary>
-internal sealed record SyncOp(OpKind Kind, string Rel, bool IsDir, string Reason, bool ReplacesLocalChanges = false)
+internal sealed record SyncOp(OpKind Kind, string Rel, bool IsDir, string Reason, bool ReplacesLocalChanges = false,
+    bool ReplacesRemoteChanges = false)
 {
     public LocalItem? Local { get; init; }
     public RemoteItem? Remote { get; init; }
@@ -78,8 +86,9 @@ internal static class Planner
     public static SyncPlan Plan(
         IReadOnlyDictionary<string, BaseEntry> baseState,
         IReadOnlyDictionary<string, LocalItem> local,
-        IReadOnlyDictionary<string, RemoteItem> remote)
+        IReadOnlyDictionary<string, RemoteItem> remote, DateTime? nowUtc = null)
     {
+        DateTime now = nowUtc ?? DateTime.UtcNow;
         var ops = new List<SyncOp>();
         var all = new SortedSet<string>(Paths);
         all.UnionWith(baseState.Keys);
@@ -103,24 +112,25 @@ internal static class Planner
             if (b != null && b.IsDir != isDir) b = null;   // был файл, стала папка (или наоборот) — база про другое
 
             if (isDir) PlanDir(ops, rel, b, l, r);
-            else PlanFile(ops, rel, b, l, r);
+            else PlanFile(ops, rel, b, l, r, now);
         }
 
         DropDirDeletesWithSurvivors(ops, local, remote);
         return new SyncPlan(ops, baseState.Values.Count(e => !e.IsDir));
     }
 
-    private static void PlanFile(List<SyncOp> ops, string rel, BaseEntry? b, LocalItem? l, RemoteItem? r)
+    private static void PlanFile(List<SyncOp> ops, string rel, BaseEntry? b, LocalItem? l, RemoteItem? r, DateTime now)
     {
         bool lChanged = l != null && (b == null || !SameHash(l.Sha256, b.Sha256));
-        bool rChanged = r != null && (b == null || RemoteDiffers(r, b));
+        bool rChanged = r != null && (b == null || RemoteDiffers(r, b, now));
 
         if (l != null && r != null)
         {
             if (r.Sha256 != null && SameHash(l.Sha256, r.Sha256))
             {
                 // база уже такая — делать нечего; иначе (первая встреча, «потрогали» файл) обновляем её
-                if (b == null || !SameHash(b.Sha256, l.Sha256) || b.Size != l.Size || b.LocalMtime != l.Mtime || b.RemoteModified != r.Modified)
+                if (b == null || !SameHash(b.Sha256, l.Sha256) || b.Size != l.Size || b.LocalMtime != l.Mtime || b.RemoteModified != r.Modified ||
+                    b.PrevRemoteSha != null)
                     ops.Add(new SyncOp(OpKind.Record, rel, false, "совпадает") { Local = l, Remote = r });
             }
             else if (!lChanged && !rChanged)
@@ -130,7 +140,8 @@ internal static class Planner
             else if (!lChanged && rChanged)
                 ops.Add(new SyncOp(OpKind.Download, rel, false, "изменён на Диске") { Local = l, Remote = r });
             else if (LocalIsNewer(l, r))
-                ops.Add(new SyncOp(OpKind.Upload, rel, false, "изменён с обеих сторон, на компьютере новее") { Local = l, Remote = r });
+                ops.Add(new SyncOp(OpKind.Upload, rel, false, "изменён с обеих сторон, на компьютере новее", ReplacesRemoteChanges: true)
+                    { Local = l, Remote = r });
             else
                 ops.Add(new SyncOp(OpKind.Download, rel, false, "изменён с обеих сторон, на Диске новее", ReplacesLocalChanges: true)
                     { Local = l, Remote = r });
@@ -201,6 +212,12 @@ internal static class Planner
         a != null && b != null && string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Файл на Диске отличается от базы: по SHA-256, а если его нет — по размеру и времени.</summary>
+    internal static bool RemoteDiffers(RemoteItem r, BaseEntry b, DateTime now)
+    {
+        if (b.PrevRemoteSha != null && b.PendingUntil > now && SameHash(r.Sha256, b.PrevRemoteSha)) return false;
+        return RemoteDiffers(r, b);
+    }
+
     internal static bool RemoteDiffers(RemoteItem r, BaseEntry b) =>
         r.Sha256 != null && b.Sha256 != null
             ? !SameHash(r.Sha256, b.Sha256)
@@ -226,10 +243,30 @@ internal static class Ignore
         string ext = Path.GetExtension(name);
         if (ext.Equals(".tmp", StringComparison.OrdinalIgnoreCase) || ext.Equals(".crdownload", StringComparison.OrdinalIgnoreCase) ||
             ext.Equals(".partial", StringComparison.OrdinalIgnoreCase)) return true;
-        // Excel при сохранении пишет временный файл с именем из 8 шестнадцатеричных цифр без расширения
-        if (name.Length == 8 && ext.Length == 0 && name.All(Uri.IsHexDigit)) return true;
         return false;
     }
+
+    /// <summary>
+    /// Похоже на временный файл сохранения Excel (8 шестнадцатеричных цифр без расширения). Так же может называться
+    /// и обычный файл («20241231»), поэтому это не исключение навсегда: обход откладывает только свежие такие файлы.
+    /// </summary>
+    public static bool LooksLikeExcelTemp(string name) =>
+        name.Length == 8 && Path.GetExtension(name).Length == 0 && name.All(Uri.IsHexDigit);
+
+    private static readonly HashSet<string> Reserved = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    };
+
+    /// <summary>
+    /// Имя с Диска, которое нельзя создать в Windows: запрещённые символы, пробел или точка в конце, CON/NUL….
+    /// Такие файлы не скачиваем (иначе Windows молча изменит имя и получится путаница), а сообщаем о них.
+    /// </summary>
+    public static bool WindowsCannot(string rel) => rel.Split('/').Any(part =>
+        part.Length == 0 || part.EndsWith(' ') || part.EndsWith('.') ||
+        part.IndexOfAny(new[] { '<', '>', ':', '"', '|', '?', '*', '\\' }) >= 0 || part.Any(c => c < 32) ||
+        Reserved.Contains(Path.GetFileNameWithoutExtension(part)));
 
     /// <summary>Путь (относительный, через «/») попадает под исключения хоть одной своей частью.</summary>
     public static bool Rel(string rel) => rel.Split('/').Any(Name);
