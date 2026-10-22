@@ -5,12 +5,9 @@ namespace YaDiskFileSync;
 
 internal sealed class TrayApp : IDisposable
 {
-    /// <summary>Сверка файла с последней загрузкой на случай пропущенных событий (сон, сетевая папка).</summary>
-    private static readonly TimeSpan SafetyCheck = TimeSpan.FromMinutes(10);
     internal static readonly int[] UpdateCheckChoices = { 1, 3, 6, 12, 24, 0 };
     private static readonly TimeSpan FirstCheckDelay = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan UpdateNoticeDelay = TimeSpan.FromSeconds(8);
-    private const string DiskAppsUrl = "https://disk.yandex.ru/client/disk/%D0%9F%D1%80%D0%B8%D0%BB%D0%BE%D0%B6%D0%B5%D0%BD%D0%B8%D1%8F";
 
     private readonly SynchronizationContext _ui;
     private readonly NotifyIcon _tray = new();
@@ -19,20 +16,23 @@ internal sealed class TrayApp : IDisposable
     private readonly Settings _settings = Settings.Load();
     private readonly Secrets _secrets = Secrets.Load();
     private readonly object _saveLock = new();
-    private readonly HttpClient _http;
+    private readonly HttpClient _http;       // вход и обновления: обычные короткие запросы
+    private readonly HttpClient _transfer;   // Диск: файлы любого размера, таймауты считает сам DiskClient
     private readonly TokenSource _tokens;
     private readonly SyncEngine _engine;
-    private readonly System.Windows.Forms.Timer _safety = new() { Interval = (int)SafetyCheck.TotalMilliseconds };
+    private readonly System.Windows.Forms.Timer _poll = new();
     private readonly System.Windows.Forms.Timer _updateTimer = new() { Interval = 30_000 };
-    private FileWatch? _watch;
-    private LoginForm? _login;
-    private bool _choosing;
+    private FolderWatch? _watch;
+    private Form? _dialog;              // открытое окно входа или настроек — одно за раз
+    private StatusForm? _statusForm;
+    private bool _asking;
     private SyncState? _shownProblem;   // о проблеме сообщаем один раз, а не на каждом повторе
-    private string? _balloonUrl;
+    private Action? _balloonAction;
     private ReleaseInfo? _pendingUpdate;
     private bool _updating;
     private readonly Version? _rolledBack;
     private string? _lastAutoError;
+    private readonly bool _needsNewRights;
 
     public UpdateHandoff? Handoff { get; private set; }
 
@@ -41,14 +41,19 @@ internal sealed class TrayApp : IDisposable
         _ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
         _http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
         _http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("YaDiskFileSync", Updater.Current.ToString()));
+        _transfer = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+        _transfer.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("YaDiskFileSync", Updater.Current.ToString()));
+        // ClientID есть, а токенов нет — значит, вход был в версии 1.x с правами только на папку приложения
+        _needsNewRights = !_secrets.SignedIn && !string.IsNullOrEmpty(_settings.ClientId);
         _tokens = new TokenSource(_secrets, OAuth, SaveSecrets);
-        _engine = new SyncEngine(() => _secrets.SignedIn ? new DiskClient(_http, _tokens) : null, _settings, SaveSettings);
+        _engine = new SyncEngine(() => _secrets.SignedIn ? Disk() : null, _settings, SaveSettings,
+            new StateStore(StateStore.DefaultFile), new RecycleBin());
         _engine.StatusChanged += s => _ui.Post(_ => Show(s), null);
 
         _menu.Opening += (_, _) => BuildMenu();
         _tray.ContextMenuStrip = _menu;
-        _tray.MouseDoubleClick += (_, e) => { if (e.Button == MouseButtons.Left) SyncNow(); };
-        _tray.BalloonTipClicked += (_, _) => OpenUrl(_balloonUrl);
+        _tray.MouseDoubleClick += (_, e) => { if (e.Button == MouseButtons.Left) OpenFolder(); };
+        _tray.BalloonTipClicked += (_, _) => { var a = _balloonAction; _balloonAction = null; a?.Invoke(); };
         _tray.Visible = true;
 
         _rolledBack = Updater.ParseVersion(rolledBack);
@@ -63,15 +68,17 @@ internal sealed class TrayApp : IDisposable
         if (updatedFrom != null && rolledBack == null)
         {
             string what = notes is { } n && Updater.BalloonText(n.Notes) is { Length: > 0 } t ? t : "Щёлкните, чтобы посмотреть, что нового.";
-            Balloon($"YaDisk File Sync обновлён до {Updater.Current.ToString(3)}", what, ToolTipIcon.Info,
-                notes?.PageUrl is { Length: > 0 } url ? url : $"https://github.com/{Updater.Repo}/releases/latest");
+            string url = notes?.PageUrl is { Length: > 0 } u ? u : $"https://github.com/{Updater.Repo}/releases/latest";
+            Balloon($"YaDisk File Sync обновлён до {Updater.Current.ToString(3)}", what, ToolTipIcon.Info, () => OpenUrl(url));
         }
 
         Show(Initial());
+        ApplyExplorer();
         _engine.Start();
         Watch();
-        _safety.Tick += (_, _) => { Watch(); _engine.Request(); };
-        _safety.Start();
+        _poll.Interval = (int)Settings.Poll(_settings.PollSeconds).TotalMilliseconds;
+        _poll.Tick += (_, _) => { Watch(); _engine.Request(); };
+        _poll.Start();
 
         _updateTimer.Tick += (_, _) =>
         {
@@ -81,40 +88,43 @@ internal sealed class TrayApp : IDisposable
         };
         ScheduleUpdateChecks();
 
-        // первый запуск: сразу ведём по шагам — вход, затем выбор файла
+        // первый запуск: ведём по шагам — вход с инструкцией, затем настройки папок
         if (!_secrets.SignedIn) _ui.Post(_ => Login(), null);
-        else if (string.IsNullOrEmpty(_settings.FilePath)) _ui.Post(_ => ChooseFile(), null);
+        else if (!Configured) _ui.Post(_ => OpenSettings(), null);
     }
+
+    private DiskClient Disk() => new(_transfer, _tokens);
 
     private YandexOAuth? OAuth() =>
         string.IsNullOrEmpty(_settings.ClientId) ? null : new YandexOAuth(_http, _settings.ClientId, _secrets.ClientSecret);
 
-    private SyncStatus Initial() =>
-        !_secrets.SignedIn ? new SyncStatus(SyncState.NeedLogin, "Войдите в Яндекс.", _settings.LastUploadedAt)
-        : string.IsNullOrEmpty(_settings.FilePath) ? new SyncStatus(SyncState.NotConfigured, "Файл не выбран.", _settings.LastUploadedAt)
-        : new SyncStatus(SyncState.Pending, "Проверяю файл…", _settings.LastUploadedAt);
+    private bool Configured => !string.IsNullOrEmpty(_settings.LocalRoot) && !string.IsNullOrEmpty(_settings.RemoteRoot);
 
-    /// <summary>(Пере)подключает слежение за выбранным файлом и сразу сверяет его с Диском.</summary>
+    private SyncStatus Initial() =>
+        !_secrets.SignedIn ? new SyncStatus(SyncState.NeedLogin, "Войдите в Яндекс.", _settings.LastSyncedAt)
+        : !Configured ? new SyncStatus(SyncState.NotConfigured, "Папки не настроены — откройте «Настройки».", _settings.LastSyncedAt)
+        : new SyncStatus(SyncState.Pending, "Сверяю папки…", _settings.LastSyncedAt);
+
+    /// <summary>(Пере)подключает слежение за папкой — например, когда подключили диск, на котором она лежит.</summary>
     private void Watch()
     {
-        string? path = _settings.FilePath;
-        if (_watch != null && _watchPath == path && _watchDirExists == DirExists(path)) return;
+        string? root = _settings.LocalRoot;
+        if (_watch != null && root != null && _watch.Root.Equals(Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase)
+            && _watch.Attached == Directory.Exists(root)) return;
         _watch?.Dispose();
         _watch = null;
-        _watchPath = path;
-        _watchDirExists = DirExists(path);
-        if (string.IsNullOrEmpty(path)) return;
-        _watch = new FileWatch(path, () =>
+        if (string.IsNullOrEmpty(root)) return;
+        _watch = new FolderWatch(root, () =>
         {
-            _ui.Post(_ => { if (_engine.Status.State is not (SyncState.Uploading or SyncState.NeedLogin)) Show(new SyncStatus(SyncState.Pending, "Есть изменения…", _settings.LastUploadedAt)); }, null);
+            _ui.Post(_ =>
+            {
+                if (_engine.Status.State is SyncState.Synced or SyncState.Retrying)
+                    Show(new SyncStatus(SyncState.Pending, "Есть изменения…", _settings.LastSyncedAt));
+            }, null);
             _engine.Request();
         });
         _engine.Request();
     }
-
-    private string? _watchPath;
-    private bool _watchDirExists;
-    private static bool DirExists(string? path) => path != null && Path.GetDirectoryName(path) is { } d && Directory.Exists(d);
 
     // ---------- состояние ----------
 
@@ -126,10 +136,16 @@ internal sealed class TrayApp : IDisposable
         _tray.Icon = icon;
         _tray.Text = Truncate("YaDisk File Sync\n" + StatusLine(s), 127);
 
-        if (s.State is SyncState.Error or SyncState.NeedLogin)
+        if (s.State is SyncState.Error or SyncState.NeedLogin or SyncState.NeedsConfirm)
         {
-            if (_shownProblem != s.State && _login == null)
-                Balloon(s.State == SyncState.NeedLogin ? "Нужно войти в Яндекс" : "Файл не синхронизирован", s.Message, ToolTipIcon.Warning);
+            if (_shownProblem != s.State && _dialog == null)
+            {
+                if (s.State == SyncState.NeedsConfirm)
+                    Balloon("Синхронизация на паузе", s.Message + " Щёлкните, чтобы решить.", ToolTipIcon.Warning, AskDeletions);
+                else
+                    Balloon(s.State == SyncState.NeedLogin ? "Нужно войти в Яндекс" : "Не всё синхронизировано", s.Message, ToolTipIcon.Warning,
+                        s.State == SyncState.NeedLogin ? Login : OpenStatus);
+            }
             _shownProblem = s.State;
         }
         else if (s.State == SyncState.Synced) _shownProblem = null;
@@ -152,78 +168,187 @@ internal sealed class TrayApp : IDisposable
     private void SyncNow()
     {
         if (!_secrets.SignedIn) { Login(); return; }
-        if (string.IsNullOrEmpty(_settings.FilePath)) { ChooseFile(); return; }
-        // «синхронизировать» вручную — загрузить даже без изменений (вдруг файл на Диске удалили)
-        _settings.LastUploadedHash = null;
-        Show(new SyncStatus(SyncState.Pending, "Синхронизирую…", _settings.LastUploadedAt));
+        if (!Configured) { OpenSettings(); return; }
+        Show(new SyncStatus(SyncState.Pending, "Синхронизирую…", _settings.LastSyncedAt));
+        Watch();
         _engine.Request();
     }
 
-    private void ChooseFile()
+    private void OpenFolder()
     {
-        if (_choosing) return;
-        _choosing = true;
-        try { ChooseFileCore(); }
-        finally { _choosing = false; }
+        if (!Configured) { OpenSettings(); return; }
+        string root = _settings.LocalRoot!;
+        try
+        {
+            Directory.CreateDirectory(root);
+            Process.Start("explorer.exe", $"\"{root}\"");
+        }
+        catch (Exception e) { Balloon("Не удалось открыть папку", e.Message, ToolTipIcon.Warning); }
     }
 
-    private void ChooseFileCore()
+    private void OpenStatus()
     {
-        using var dlg = new OpenFileDialog
+        if (_statusForm is { IsDisposed: false }) { _statusForm.Activate(); return; }
+        _statusForm = new StatusForm(_engine);
+        _statusForm.FormClosed += (_, _) => { _statusForm?.Dispose(); _statusForm = null; };
+        _statusForm.Show();
+    }
+
+    /// <summary>Пропало много файлов: удалить и на другой стороне или вернуть их.</summary>
+    private void AskDeletions()
+    {
+        if (_asking || _engine.Question is not { } q) return;
+        _asking = true;
+        try
         {
-            Title = "Какой файл синхронизировать с Яндекс.Диском",
-            Filter = "Книги Excel|*.xlsx;*.xlsm;*.xls;*.xlsb|Все файлы|*.*",
-            CheckFileExists = true,
-        };
-        if (_settings.FilePath is { } cur && Path.GetDirectoryName(cur) is { } d && Directory.Exists(d)) dlg.InitialDirectory = d;
-        if (dlg.ShowDialog() != DialogResult.OK) return;
-        _settings.FilePath = dlg.FileName;
-        SaveSettings();
-        Show(new SyncStatus(SyncState.Pending, "Проверяю файл…", _settings.LastUploadedAt));
-        Watch();
+            string sample = q.Samples.Count > 0 ? "\n\nНапример:\n" + string.Join("\n", q.Samples.Take(8).Select(x => "  " + x.Replace('/', '\\'))) : "";
+            string where = q.RemoteRootMissing ? "на компьютере" : q.RemoteDeletes > 0 && q.LocalDeletes > 0 ? "с обеих сторон" :
+                q.RemoteDeletes > 0 ? "на Яндекс.Диске" : "на компьютере";
+            var answer = MessageBox.Show(
+                SyncEngine.Explain(q) + sample +
+                $"\n\nДа — удалить их и {where} (в Корзину, оттуда можно восстановить)." +
+                "\nНет — вернуть файлы: скопировать обратно туда, где они пропали." +
+                "\nОтмена — решить позже (синхронизация остаётся на паузе).",
+                "YaDisk File Sync — пропали файлы", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+            if (answer == DialogResult.Yes) _engine.Resolve(delete: true);
+            else if (answer == DialogResult.No) _engine.Resolve(delete: false);
+        }
+        finally { _asking = false; }
     }
 
     private void Login()
     {
-        if (_login != null) { _login.Activate(); return; }
-        _login = new LoginForm(_http, _settings.ClientId, _secrets.ClientSecret);
+        if (_dialog != null) { _dialog.Activate(); return; }
+        using var form = new LoginForm(_http, _settings.ClientId, _secrets.ClientSecret, rightsChanged: _needsNewRights);
+        _dialog = form;
         try
         {
-            if (_login.ShowDialog() != DialogResult.OK || _login.Token is not { } t) return;
-            _settings.ClientId = _login.ClientId;
+            if (form.ShowDialog() != DialogResult.OK || form.Token is not { } t) return;
+            _settings.ClientId = form.ClientId;
+            _settings.AccountUid = null;   // мог войти другой человек — учётную запись узнаем заново
+            _settings.AccountLogin = null;
             lock (_secrets.Sync)
             {
                 _secrets.Generation++;
-                _secrets.ClientSecret = _login.ClientSecret.Length > 0 ? _login.ClientSecret : null;
+                _secrets.ClientSecret = form.ClientSecret.Length > 0 ? form.ClientSecret : null;
                 _secrets.AccessToken = t.AccessToken;
                 _secrets.RefreshToken = t.RefreshToken;
                 _secrets.ExpiresAt = t.ExpiresAt;
+                _secrets.Scope = Secrets.CurrentScope;
                 SaveSecrets();
             }
-            _settings.LastUploadedHash = null;   // новый вход (может, другой аккаунт) — загрузить заново
             SaveSettings();
-            Balloon("Вход выполнен", "Файл будет загружаться в папку «Приложения» на Яндекс.Диске.", ToolTipIcon.Info);
+            Balloon("Вход выполнен", Configured ? "Синхронизация продолжается." : "Осталось выбрать папки в настройках.", ToolTipIcon.Info);
+            _ = FetchAccountAsync();
         }
-        finally
-        {
-            _login.Dispose();
-            _login = null;
-        }
-        if (string.IsNullOrEmpty(_settings.FilePath)) ChooseFile();
+        finally { _dialog = null; }
+        if (!Configured) OpenSettings();
         else { Show(Initial()); _engine.Request(); }
     }
 
-    private void Logout()
+    private async Task FetchAccountAsync()
     {
-        if (MessageBox.Show("Выйти из Яндекса? Файл перестанет загружаться на Диск, пока вы не войдёте снова.",
-                "YaDisk File Sync", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+        try
+        {
+            if (await Disk().GetUserAsync(CancellationToken.None) is { } u)
+            {
+                _settings.AccountUid = u.Uid;
+                _settings.AccountLogin = u.Login;
+                SaveSettings();
+            }
+        }
+        catch { /* узнаем при первом проходе */ }
+    }
+
+    /// <summary>Выход: папка и файлы на компьютере остаются, синхронизация просто останавливается.</summary>
+    private bool Logout()
+    {
+        if (MessageBox.Show("Выйти из Яндекса?\n\nПапка и все файлы на компьютере останутся на месте; синхронизация остановится, " +
+                            "пока вы не войдёте снова.", "YaDisk File Sync", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK)
+            return false;
         lock (_secrets.Sync)
         {
             _secrets.Generation++;
             _secrets.ClearTokens();
             SaveSecrets();
         }
+        _settings.AccountLogin = null;
+        SaveSettings();
+        _engine.Set(Initial());
+        return true;
+    }
+
+    private void OpenSettings()
+    {
+        if (_dialog != null) { _dialog.Activate(); return; }
+        bool autostart = SafeAutostart() || (!Configured && Updater.ExePath != null);
+        using var form = new SettingsForm(_settings, autostart, () => _secrets.SignedIn, () => _settings.AccountLogin,
+            () =>
+            {
+                if (_secrets.SignedIn) Logout();
+                else { var d = _dialog; _dialog = null; try { Login(); } finally { _dialog = d; } }
+            },
+            _secrets.SignedIn ? (path, ct) => Disk().ListFoldersAsync(path, ct) : null,
+            () => CheckUpdates(manual: true));
+        _dialog = form;
+        try
+        {
+            if (form.ShowDialog() != DialogResult.OK || form.Choice is not { } c) return;
+            Apply(c);
+        }
+        finally { _dialog = null; }
+    }
+
+    private void Apply(SettingsChoice c)
+    {
+        bool foldersChanged = Configured &&
+            (!string.Equals(Path.GetFullPath(_settings.LocalRoot!), c.LocalRoot, StringComparison.OrdinalIgnoreCase) ||
+             !string.Equals(DiskPath.Normalize(_settings.RemoteRoot!), c.RemoteRoot, StringComparison.OrdinalIgnoreCase));
+        if (foldersChanged && MessageBox.Show(
+                $"Синхронизировать {c.LocalRoot}\nс папкой Диска {DiskPath.Display(c.RemoteRoot)}?\n\n" +
+                "Содержимое двух папок будет объединено, при этом ничего не удаляется. Прежняя папка на компьютере останется как есть.",
+                "YaDisk File Sync", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+
+        try { Directory.CreateDirectory(c.LocalRoot); }
+        catch (Exception e)
+        {
+            MessageBox.Show("Не удалось создать папку: " + e.Message, "YaDisk File Sync", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return;
+        }
+        _settings.LocalRoot = c.LocalRoot;
+        _settings.RemoteRoot = c.RemoteRoot;
+        _settings.PollSeconds = c.PollSeconds;
+        _settings.ShowInExplorer = c.ShowInExplorer;
+        bool scheduleChanged = _settings.UpdateCheckHours != c.UpdateCheckHours;
+        _settings.UpdateCheckHours = c.UpdateCheckHours;
+        _settings.AutoUpdate = c.AutoUpdate;
+        SaveSettings();
+
+        try { if (SafeAutostart() != c.Autostart) Autostart.Enabled = c.Autostart; }
+        catch (Exception e) { Balloon("Автозапуск", e.Message, ToolTipIcon.Error); }
+        ApplyExplorer();
+        _poll.Interval = (int)Settings.Poll(_settings.PollSeconds).TotalMilliseconds;
+        if (scheduleChanged) ScheduleUpdateChecks();
         Show(Initial());
+        Watch();
+        _engine.Request();
+    }
+
+    /// <summary>Пункт папки в панели навигации Проводника и значок на самой папке.</summary>
+    private void ApplyExplorer()
+    {
+        string? exe = Environment.ProcessPath;
+        try
+        {
+            if (_settings.ShowInExplorer && Configured && exe != null && Updater.ExePath != null)
+            {
+                Directory.CreateDirectory(_settings.LocalRoot!);
+                Explorer.Register(_settings.LocalRoot!, exe);
+                Explorer.SetFolderIcon(_settings.LocalRoot!, exe);
+            }
+            else if (!_settings.ShowInExplorer && Explorer.RegisteredFolder() != null) Explorer.Unregister();
+        }
+        catch (Exception e) { Balloon("Не удалось добавить папку в Проводник", e.Message, ToolTipIcon.Warning); }
     }
 
     private void SaveSettings()
@@ -248,74 +373,27 @@ internal sealed class TrayApp : IDisposable
     {
         _menu.Items.Clear();
         _menu.Items.Add(new ToolStripMenuItem(Truncate(StatusLine(_engine.Status), 90)) { Enabled = false });
-        _menu.Items.Add(new ToolStripMenuItem("Синхронизировать сейчас", null, (_, _) => SyncNow())
-        { Enabled = _secrets.SignedIn && _settings.FilePath != null, Font = new Font(_menu.Font, FontStyle.Bold) });
         _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(new ToolStripMenuItem($"Открыть папку {Settings.DefaultFolderName}", null, (_, _) => OpenFolder())
+            { Font = new Font(_menu.Font, FontStyle.Bold), Enabled = Configured });
+        if (_settings.RemoteRoot is { } rr)
+            _menu.Items.Add(new ToolStripMenuItem("Открыть папку на Яндекс.Диске", null, (_, _) => OpenUrl(DiskPath.WebUrl(rr))));
 
-        string fileText = _settings.FilePath is { } p ? "Файл: " + Truncate(Path.GetFileName(p), 50) : "Выбрать файл…";
-        _menu.Items.Add(new ToolStripMenuItem(fileText, null, (_, _) => ChooseFile()) { ToolTipText = _settings.FilePath ?? "" });
-        if (_settings.FilePath is { } path && File.Exists(path))
-            _menu.Items.Add(new ToolStripMenuItem("Показать файл в папке", null,
-                (_, _) => { try { Process.Start("explorer.exe", $"/select,\"{path}\""); } catch { } }));
-        _menu.Items.Add(new ToolStripMenuItem("Открыть Яндекс.Диск (папка «Приложения»)", null, (_, _) => OpenUrl(DiskAppsUrl)));
+        var sync = new ToolStripMenuItem("Синхронизация");
+        sync.DropDownItems.Add(new ToolStripMenuItem("Синхронизировать сейчас", null, (_, _) => SyncNow())
+            { Enabled = _secrets.SignedIn && Configured });
+        sync.DropDownItems.Add(new ToolStripMenuItem("Статус синхронизации", null, (_, _) => OpenStatus()));
+        _menu.Items.Add(sync);
+        if (_engine.Question != null)
+            _menu.Items.Add(new ToolStripMenuItem("Пропали файлы — решить…", null, (_, _) => AskDeletions()) { Font = new Font(_menu.Font, FontStyle.Bold) });
         if (!_secrets.SignedIn || _engine.Status.State == SyncState.NeedLogin)
             _menu.Items.Add(new ToolStripMenuItem("Войти в Яндекс…", null, (_, _) => Login()));
-        if (_secrets.SignedIn)
-            _menu.Items.Add(new ToolStripMenuItem("Выйти из Яндекса", null, (_, _) => Logout()));
-
-        var keep = new ToolStripMenuItem($"Хранить копий по дням: {_settings.KeepCopies}");
-        foreach (int n in new[] { 7, 14, 30, 60, 90 })
-        {
-            int k = n;
-            keep.DropDownItems.Add(new ToolStripMenuItem(k.ToString(), null, (_, _) => SetKeep(k))
-            { Checked = k == _settings.KeepCopies });
-        }
-        _menu.Items.Add(keep);
-        _menu.Items.Add(new ToolStripSeparator());
-
-        var auto = new ToolStripMenuItem("Запускать вместе с Windows") { Checked = SafeAutostart() };
-        auto.Click += (_, _) =>
-        {
-            try { Autostart.Enabled = !auto.Checked; }
-            catch (Exception ex) { Balloon("Автозапуск", ex.Message, ToolTipIcon.Error); }
-        };
-        _menu.Items.Add(auto);
-
-        var checkEvery = new ToolStripMenuItem($"Проверять обновления: {IntervalName(_settings.UpdateCheckHours).ToLowerInvariant()}");
-        foreach (int hours in UpdateCheckChoices)
-        {
-            int h = hours;
-            checkEvery.DropDownItems.Add(new ToolStripMenuItem(IntervalName(h), null, (_, _) =>
-            {
-                if (_settings.UpdateCheckHours == h) return;
-                _settings.UpdateCheckHours = h;
-                SaveSettings();
-                ScheduleUpdateChecks();
-            }) { Checked = h == _settings.UpdateCheckHours });
-        }
-        _menu.Items.Add(checkEvery);
-        var autoUpd = new ToolStripMenuItem("Устанавливать обновления сами") { Checked = _settings.AutoUpdate };
-        autoUpd.Click += (_, _) => { _settings.AutoUpdate = !_settings.AutoUpdate; SaveSettings(); };
-        _menu.Items.Add(autoUpd);
+        _menu.Items.Add(new ToolStripMenuItem("Настройки…", null, (_, _) => OpenSettings()));
         if (_pendingUpdate is { } upd && Updater.IsNewer(upd))
             _menu.Items.Add(new ToolStripMenuItem($"Установить обновление {upd.Version.ToString(3)}", null,
                 (_, _) => InstallUpdate(upd, manual: true)) { Enabled = !_updating });
-        else
-            _menu.Items.Add(new ToolStripMenuItem($"Проверить обновления (версия {Updater.Current.ToString(3)})", null,
-                (_, _) => CheckUpdates(manual: true)) { Enabled = !_updating });
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(new ToolStripMenuItem("Выход", null, (_, _) => Exit()));
-    }
-
-    private void SetKeep(int k)
-    {
-        if (k == _settings.KeepCopies) return;
-        if (k < _settings.KeepCopies && MessageBox.Show(
-                $"Хранить {k} копий вместо {_settings.KeepCopies}? При следующей загрузке более старые дневные копии " +
-                "будут удалены с Диска насовсем, мимо Корзины.", "YaDisk File Sync",
-                MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
-        _settings.KeepCopies = k;
-        SaveSettings();
     }
 
     private static bool SafeAutostart()
@@ -356,7 +434,7 @@ internal sealed class TrayApp : IDisposable
         try { r = await Updater.FetchLatestAsync(); }
         catch (Exception e)   // async void: исключение отсюда уронило бы программу
         {
-            if (manual) Balloon("Не удалось проверить обновления", e is UpdateException ? e.Message : e.Message, ToolTipIcon.Warning);
+            if (manual) Balloon("Не удалось проверить обновления", e.Message, ToolTipIcon.Warning);
             return;
         }
         if (r == null || !Updater.IsNewer(r))
@@ -371,28 +449,30 @@ internal sealed class TrayApp : IDisposable
         else if (_lastAutoError != "offer:" + r.Tag)
         {
             _lastAutoError = "offer:" + r.Tag;
-            Balloon("Доступно обновление", $"Версия {r.Version.ToString(3)}: ПКМ по значку → «Установить обновление».", ToolTipIcon.Info, r.PageUrl);
+            Balloon("Доступно обновление", $"Версия {r.Version.ToString(3)}: ПКМ по значку → «Установить обновление».", ToolTipIcon.Info,
+                () => OpenUrl(r.PageUrl));
         }
     }
 
-    /// <summary>Не перезапускаемся посреди загрузки файла — дождёмся следующей проверки.</summary>
-    private bool Busy => _engine.Status.State is SyncState.Uploading or SyncState.Pending || _login != null;
+    /// <summary>Не перезапускаемся посреди синхронизации или открытого окна — дождёмся следующей проверки.</summary>
+    private bool Busy => _engine.Status.State is SyncState.Syncing or SyncState.Pending || _dialog is LoginForm || _asking;
 
     private async void InstallUpdate(ReleaseInfo r, bool manual)
     {
         if (_updating || Handoff != null || Updater.ExePath is not { } exe) return;
-        if (!manual && Busy) return;
+        if (!manual && (Busy || _dialog != null)) return;
         _updating = true;
         try
         {
             Balloon("Найдено обновление YaDisk File Sync",
-                $"Версия {r.Version.ToString(3)}. Устанавливаю — программа перезапустится через несколько секунд.", ToolTipIcon.Info, r.PageUrl);
+                $"Версия {r.Version.ToString(3)}. Устанавливаю — программа перезапустится через несколько секунд.", ToolTipIcon.Info,
+                () => OpenUrl(r.PageUrl));
             string file = await Updater.DownloadAsync(r, exe);
             await Task.Delay(UpdateNoticeDelay);
-            if (Busy || (!manual && (!_settings.AutoUpdate || CheckInterval(_settings.UpdateCheckHours) == null)))
+            if (Busy || (!manual && (_dialog != null || !_settings.AutoUpdate || CheckInterval(_settings.UpdateCheckHours) == null)))
             {
                 try { File.Delete(file); } catch { }
-                Balloon("Обновление отложено", $"Версию {r.Version.ToString(3)} можно установить из меню по правой кнопке.", ToolTipIcon.Info, r.PageUrl);
+                Balloon("Обновление отложено", $"Версию {r.Version.ToString(3)} можно установить из меню по правой кнопке.", ToolTipIcon.Info);
                 return;
             }
             Updater.SaveNotes(r);
@@ -413,9 +493,9 @@ internal sealed class TrayApp : IDisposable
 
     // ---------- прочее ----------
 
-    private void Balloon(string title, string text, ToolTipIcon icon, string? url = null)
+    private void Balloon(string title, string text, ToolTipIcon icon, Action? onClick = null)
     {
-        _balloonUrl = url;
+        _balloonAction = onClick;
         _tray.ShowBalloonTip(5000, title, Truncate(text, 250), icon);
     }
 
@@ -428,18 +508,22 @@ internal sealed class TrayApp : IDisposable
     private void Exit()
     {
         _tray.Visible = false;
+        _dialog?.Close();
+        _statusForm?.Close();
         Application.ExitThread();
     }
 
     public void Dispose()
     {
-        _safety.Dispose();
+        _poll.Dispose();
         _updateTimer.Dispose();
         _watch?.Dispose();
         _engine.Dispose();
+        _statusForm?.Dispose();
         _tray.Dispose();
         _menu.Dispose();
         foreach (var i in _icons.Values) i.Dispose();
         _http.Dispose();
+        _transfer.Dispose();
     }
 }
