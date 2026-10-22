@@ -2,9 +2,20 @@ namespace YaDiskFileSync;
 
 internal static class Program
 {
+    public const string UnregisterFlag = "--unregister";
+
     [STAThread]
     private static void Main(string[] args)
     {
+        // деинсталлятор: убрать пункт Проводника и автозапуск; папку и файлы пользователя не трогаем
+        if (args.Contains(UnregisterFlag))
+        {
+            try { Explorer.Unregister(); } catch { }
+            try { Autostart.Enabled = false; } catch { }
+            return;
+        }
+        Installer.SyncDisplayVersion();
+
         string? updatedFrom = FlagValue(args, Updater.UpdatedFlag);
         string? rolledBack = FlagValue(args, Updater.RolledBackFlag);
 
@@ -53,5 +64,28 @@ internal static class Program
     {
         int i = Array.IndexOf(args, flag);
         return i < 0 ? null : i + 1 < args.Length ? args[i + 1] : "";
+    }
+}
+
+/// <summary>Связь с установщиком Inno Setup (установка для текущего пользователя, без прав администратора).</summary>
+internal static class Installer
+{
+    /// <summary>Ключ удаления, который создаёт Inno Setup: AppId + «_is1».</summary>
+    internal const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\YaDiskFileSync_is1";
+
+    /// <summary>
+    /// Программа обновляет себя сама, минуя установщик; чтобы «Приложения и возможности» показывали
+    /// настоящую версию, поправляем её в записи установщика.
+    /// </summary>
+    public static void SyncDisplayVersion()
+    {
+        try
+        {
+            using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(UninstallKey, writable: true);
+            if (k == null) return;
+            string v = Updater.Current.ToString(3);
+            if (k.GetValue("DisplayVersion") as string != v) k.SetValue("DisplayVersion", v);
+        }
+        catch { }
     }
 }

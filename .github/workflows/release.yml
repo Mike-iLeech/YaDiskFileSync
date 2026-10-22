@@ -41,12 +41,27 @@ jobs:
       - name: Сборка EXE
         run: dotnet publish YaDiskFileSync.csproj -c Release -o publish
 
+      - name: Установщик (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $ver = ([xml](Get-Content YaDiskFileSync.csproj)).Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
+          & $iscc "/DAppVersion=$ver" installer\YaDiskSync.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item publish\YaDiskFileSync-Setup.exe
+
       - name: EXE как артефакт (PR)
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: YaDiskFileSync-pr${{ github.event.number }}
-          path: publish/YaDiskFileSync.exe
+          path: |
+            publish/YaDiskFileSync.exe
+            publish/YaDiskFileSync-Setup.exe
           retention-days: 14
 
       - name: Публикация релиза
@@ -64,9 +79,9 @@ jobs:
           Set-Content notes.md $notes -Encoding utf8
           gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag publish/YaDiskFileSync.exe --clobber
+            gh release upload $tag publish/YaDiskFileSync.exe publish/YaDiskFileSync-Setup.exe --clobber
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
             gh release edit $tag --notes-file notes.md
           } else {
-            gh release create $tag publish/YaDiskFileSync.exe --title "YaDisk File Sync $ver" --notes-file notes.md
+            gh release create $tag publish/YaDiskFileSync.exe publish/YaDiskFileSync-Setup.exe --title "YaDisk File Sync $ver" --notes-file notes.md
           }

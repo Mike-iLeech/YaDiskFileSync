@@ -15,9 +15,9 @@ internal static class IconArt
     public static Color For(SyncState s) => s switch
     {
         SyncState.Synced => Green,
-        SyncState.Pending or SyncState.Uploading => Blue,
+        SyncState.Pending or SyncState.Syncing => Blue,
         SyncState.Retrying => Orange,
-        SyncState.Error or SyncState.NeedLogin => Red,
+        SyncState.Error or SyncState.NeedLogin or SyncState.NeedsConfirm => Red,
         _ => Gray,
     };
 

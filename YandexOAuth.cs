@@ -21,10 +21,12 @@ internal sealed class OAuthException(string message, string? error = null, Excep
 internal sealed class YandexOAuth(HttpClient http, string clientId, string? clientSecret)
 {
     public const string Host = "https://oauth.yandex.ru";
+    /// <summary>Права, которые нужны программе: чтение и запись всего Диска, сведения о Диске (учётная запись).</summary>
+    public const string Scope = "cloud_api:disk.read cloud_api:disk.write cloud_api:disk.info";
 
     public async Task<DeviceCode> RequestDeviceCodeAsync(string deviceName, CancellationToken ct = default)
     {
-        var form = new Dictionary<string, string> { ["client_id"] = clientId, ["device_name"] = deviceName };
+        var form = new Dictionary<string, string> { ["client_id"] = clientId, ["device_name"] = deviceName, ["scope"] = Scope };
         using var doc = await PostAsync("/device/code", form, ct);
         var r = doc.RootElement;
         string code = Str(r, "device_code") ?? throw new OAuthException("Яндекс не выдал код подтверждения.");
@@ -113,7 +115,8 @@ internal sealed class YandexOAuth(HttpClient http, string clientId, string? clie
         "invalid_client" => "Яндекс не узнал приложение: проверьте ClientID и секрет.",
         "unauthorized_client" => "Приложение на oauth.yandex.ru ещё не одобрено или заблокировано.",
         "invalid_grant" => "Вход устарел или отозван — войдите заново.",
-        "invalid_scope" => "Права приложения изменились — войдите заново.",
+        "invalid_scope" => "У приложения на oauth.yandex.ru не хватает прав. Отметьте в разделе «Яндекс.Диск REST API»: " +
+                           "«Чтение всего Диска», «Запись в любом месте на Диске» и «Доступ к информации о Диске», сохраните и войдите снова.",
         "authorization_pending" => "Ожидаем подтверждения кода.",
         _ => $"Ошибка входа в Яндекс: {description ?? error ?? "HTTP " + status}.",
     };

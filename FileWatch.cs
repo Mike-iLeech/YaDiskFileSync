@@ -1,28 +1,31 @@
 namespace YaDiskFileSync;
 
 /// <summary>
-/// Следит за папкой файла. Excel сохраняет не «на место»: пишет временный файл и переименовывает
-/// его в исходное имя, поэтому ловим и изменение, и создание, и переименование в наше имя.
-/// После последнего события ждём паузу (Debounce) — за это время Excel заканчивает сохранение.
+/// Следит за папкой синхронизации со всеми подпапками. Excel сохраняет через временный файл и
+/// переименование, поэтому после последнего события ждём паузу (Debounce) — за это время сохранение
+/// заканчивается, и проход видит уже готовый файл. События про служебные и временные файлы отбрасываем.
 /// </summary>
-internal sealed class FileWatch : IDisposable
+internal sealed class FolderWatch : IDisposable
 {
     public static readonly TimeSpan Debounce = TimeSpan.FromSeconds(3);
 
-    private readonly string _path;
+    private readonly string _root;
     private readonly Action _changed;
     private readonly System.Threading.Timer _timer;
     private FileSystemWatcher? _fsw;
     private readonly object _gate = new();
     private bool _disposed;
 
-    public FileWatch(string path, Action changed)
+    public FolderWatch(string root, Action changed)
     {
-        _path = Path.GetFullPath(path);
+        _root = Path.GetFullPath(root);
         _changed = changed;
         _timer = new System.Threading.Timer(_ => _changed(), null, Timeout.Infinite, Timeout.Infinite);
         Attach();
     }
+
+    public string Root => _root;
+    public bool Attached { get { lock (_gate) return _fsw != null; } }
 
     private void Attach()
     {
@@ -33,18 +36,18 @@ internal sealed class FileWatch : IDisposable
     {
         _fsw?.Dispose();
         _fsw = null;
-        string? dir = Path.GetDirectoryName(_path);
-        if (dir == null || !Directory.Exists(dir)) return;
-        var w = new FileSystemWatcher(dir)
+        if (!Directory.Exists(_root)) return;
+        var w = new FileSystemWatcher(_root)
         {
-            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
-            IncludeSubdirectories = false,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size,
+            IncludeSubdirectories = true,
             InternalBufferSize = 64 * 1024,
         };
         w.Changed += (_, e) => On(e.Name);
         w.Created += (_, e) => On(e.Name);
-        w.Renamed += (_, e) => On(e.Name);
-        // переполнение буфера или пропавшая сеть: события могли потеряться — переподключаемся и проверяем файл
+        w.Deleted += (_, e) => On(e.Name);
+        w.Renamed += (_, e) => { On(e.OldName); On(e.Name); };
+        // переполнение буфера или пропавшая сеть: события могли потеряться — переподключаемся и сверяем всё
         w.Error += (_, _) => { Attach(); Kick(); };
         w.EnableRaisingEvents = true;
         _fsw = w;
@@ -52,12 +55,12 @@ internal sealed class FileWatch : IDisposable
 
     private void On(string? name)
     {
-        if (IsTarget(name, Path.GetFileName(_path))) Kick();
+        if (IsRelevant(name)) Kick();
     }
 
-    /// <summary>Событие про наш файл? Блокировку Excel «~$Книга.xlsx» и временные файлы отбрасываем.</summary>
-    internal static bool IsTarget(string? eventName, string target) =>
-        eventName != null && string.Equals(Path.GetFileName(eventName), target, StringComparison.OrdinalIgnoreCase);
+    /// <summary>Событие про синхронизируемый путь? Служебную папку, блокировки Office и временные файлы отбрасываем.</summary>
+    internal static bool IsRelevant(string? relName) =>
+        relName != null && !Ignore.Rel(relName.Replace('\\', '/'));
 
     /// <summary>Перезапускает отсчёт паузы.</summary>
     public void Kick()
