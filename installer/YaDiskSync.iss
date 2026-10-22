@@ -33,7 +33,7 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 LicenseFile=..\LICENSE
-; запущенную программу установщик закроет сам (она держит этот мьютекс)
+; программа держит этот мьютекс: если она запущена, установщик попросит её закрыть (ПКМ по значку → «Выход»)
 AppMutex=Local\YaDiskFileSync.SingleInstance
 CloseApplications=yes
 RestartApplications=no
