@@ -27,8 +27,9 @@ internal sealed class FakeHttp : HttpMessageHandler
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
-        string body = request.Content == null ? "" : await request.Content.ReadAsStringAsync(ct);
+        // длину — до чтения тела: после буферизации HttpContent узнаёт её и сам
         ContentLengths.Add(request.Content?.Headers.ContentLength);
+        string body = request.Content == null ? "" : await request.Content.ReadAsStringAsync(ct);
         Requests.Add((request.Method, request.RequestUri!.AbsoluteUri, request.Headers.Authorization?.ToString(), body));
         if (_answers.Count == 0) throw new InvalidOperationException("Неожиданный запрос: " + request.RequestUri);
         return _answers.Dequeue()(request);
