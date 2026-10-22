@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Security.Cryptography;
 
 namespace YaDiskFileSync;
@@ -45,6 +46,7 @@ internal sealed class SyncEngine : IDisposable
     private readonly object _gate = new();
     private bool _dirty;
     private Task? _loop;
+    private CancellationTokenSource? _retry;   // отложенный повтор — всегда не больше одного
 
     public event Action<SyncStatus>? StatusChanged;
     public SyncStatus Status { get; private set; }
@@ -87,13 +89,22 @@ internal sealed class SyncEngine : IDisposable
             lock (_gate) { run = _dirty; _dirty = false; }
             if (!run) continue;
 
-            var result = await RunOnceAsync(ct);
+            _retry?.Cancel();
+            SyncStatus result;
+            try { result = await RunOnceAsync(ct); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
+            catch (Exception e)
+            {
+                // непредвиденное (странный ответ сервера и т.п.) не должно останавливать синхронизацию навсегда
+                result = new SyncStatus(SyncState.Retrying, "Сбой: " + e.Message, _settings.LastUploadedAt);
+            }
             if (result.State == SyncState.Retrying)
             {
                 var pause = Backoff[Math.Min(failures, Backoff.Length - 1)];
                 failures++;
                 Publish(result with { NextRetry = _now() + pause });
-                _ = RetryLaterAsync(pause, ct);
+                _retry = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                _ = RetryLaterAsync(pause, _retry.Token);
             }
             else
             {
@@ -189,7 +200,7 @@ internal sealed class SyncEngine : IDisposable
                 var after = new FileInfo(path);
                 if (after.Length != len || after.LastWriteTimeUtc != mtime || data.Length != len)
                     throw new IOException("файл менялся во время чтения");
-                if (IsZipBook(path) && !(data.Length >= 4 && data[0] == 'P' && data[1] == 'K'))
+                if (IsZipBook(path) && !IsCompleteZip(data))
                     throw new IOException("файл записан не полностью");
                 return new FileSnapshot(data, Convert.ToHexString(SHA256.HashData(data)));
             }
@@ -201,7 +212,27 @@ internal sealed class SyncEngine : IDisposable
     }
 
     private static bool IsZipBook(string path) =>
-        Path.GetExtension(path).ToLowerInvariant() is ".xlsx" or ".xlsm" or ".xltx" or ".xltm";
+        Path.GetExtension(path).ToLowerInvariant() is ".xlsx" or ".xlsm" or ".xlsb" or ".xltx" or ".xltm";
+
+    /// <summary>
+    /// Zip пишется с начала, а оглавление — в самом конце: недописанный архив открыть не получится.
+    /// Читаем оглавление и распаковываем каждую запись: обрезанные данные дают ошибку.
+    /// </summary>
+    internal static bool IsCompleteZip(byte[] data)
+    {
+        try
+        {
+            using var zip = new ZipArchive(new MemoryStream(data, writable: false), ZipArchiveMode.Read);
+            if (zip.Entries.Count == 0) return false;
+            foreach (var entry in zip.Entries)
+            {
+                using var s = entry.Open();
+                s.CopyTo(Stream.Null);
+            }
+            return true;
+        }
+        catch (Exception e) when (e is InvalidDataException or IOException or NotSupportedException) { return false; }
+    }
 
     private void Publish(SyncStatus s)
     {

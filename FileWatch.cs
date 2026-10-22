@@ -13,6 +13,8 @@ internal sealed class FileWatch : IDisposable
     private readonly Action _changed;
     private readonly System.Threading.Timer _timer;
     private FileSystemWatcher? _fsw;
+    private readonly object _gate = new();
+    private bool _disposed;
 
     public FileWatch(string path, Action changed)
     {
@@ -23,6 +25,11 @@ internal sealed class FileWatch : IDisposable
     }
 
     private void Attach()
+    {
+        lock (_gate) { if (!_disposed) AttachLocked(); }
+    }
+
+    private void AttachLocked()
     {
         _fsw?.Dispose();
         _fsw = null;
@@ -53,11 +60,21 @@ internal sealed class FileWatch : IDisposable
         eventName != null && string.Equals(Path.GetFileName(eventName), target, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Перезапускает отсчёт паузы.</summary>
-    public void Kick() => _timer.Change(Debounce, Timeout.InfiniteTimeSpan);
+    public void Kick()
+    {
+        // события приходят из пула потоков и могут опоздать к Dispose — исключение там уронило бы программу
+        lock (_gate) { if (!_disposed) _timer.Change(Debounce, Timeout.InfiniteTimeSpan); }
+    }
 
     public void Dispose()
     {
-        _fsw?.Dispose();
-        _timer.Dispose();
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            _fsw?.Dispose();
+            _fsw = null;
+            _timer.Dispose();
+        }
     }
 }

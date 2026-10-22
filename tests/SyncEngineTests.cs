@@ -124,7 +124,6 @@ public class SyncEngineTests : IDisposable
     public async Task DailyCopyFails_MainUploaded_StillRetries()
     {
         Book();
-        var e = Engine();
         var disk = new FlakySecondUpload(_disk);
         var r = await new SyncEngine(() => disk, _settings, () => _saved++, () => _now, (_, _) => Task.CompletedTask).RunOnceAsync(default);
         Assert.Equal(SyncState.Retrying, r.State);

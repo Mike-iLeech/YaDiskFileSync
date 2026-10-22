@@ -58,7 +58,7 @@ internal sealed class DiskClient(HttpClient http, ITokenSource tokens) : IDisk
     public async Task EnsureFolderAsync(string path, CancellationToken ct)
     {
         try { (await ApiAsync(HttpMethod.Put, $"/resources?path={Uri.EscapeDataString(path)}", ct))?.Dispose(); }
-        catch (DiskException e) when (e.InnerException is HttpConflict) { /* папка уже есть */ }
+        catch (DiskException e) when (e.InnerException is HttpConflict c && c.ApiError == "DiskPathPointsToExistentDirectoryError") { /* папка уже есть */ }
     }
 
     public async Task<IReadOnlyList<string>> ListFileNamesAsync(string folder, CancellationToken ct)
@@ -134,7 +134,8 @@ internal sealed class DiskClient(HttpClient http, ITokenSource tokens) : IDisk
             401 => new DiskException("Яндекс.Диск не принял вход — войдите заново.", DiskErrorKind.Auth),
             403 => new DiskException("Доступ запрещён: возможно, место на Диске кончилось или приложению не хватает прав.", DiskErrorKind.Fatal),
             404 => new DiskException("Папка на Диске не найдена.", DiskErrorKind.Transient, new HttpNotFound()),
-            409 => new DiskException("Ресурс уже существует.", DiskErrorKind.Transient, new HttpConflict()),
+            409 => new DiskException(apiError == "DiskPathDoesntExistsError" ? "Папка на Диске не найдена." : "Конфликт на Яндекс.Диске" + (apiError != null ? " (" + apiError + ")." : "."),
+                DiskErrorKind.Transient, new HttpConflict(apiError)),
             413 => new DiskException("Файл слишком большой для вашего тарифа Яндекс.Диска.", DiskErrorKind.Fatal),
             423 => new DiskException("Яндекс.Диск временно не принимает файлы.", DiskErrorKind.Transient),
             429 => new DiskException("Слишком много запросов — повторим позже.", DiskErrorKind.Transient),
@@ -144,7 +145,10 @@ internal sealed class DiskClient(HttpClient http, ITokenSource tokens) : IDisk
         };
     }
 
-    private sealed class HttpConflict : Exception;
+    private sealed class HttpConflict(string? apiError) : Exception
+    {
+        public string? ApiError { get; } = apiError;
+    }
     private sealed class HttpNotFound : Exception;
 }
 
@@ -158,8 +162,13 @@ internal sealed class TokenSource(Secrets secrets, Func<YandexOAuth?> oauth, Act
         await _lock.WaitAsync(ct);
         try
         {
-            if (!secrets.SignedIn)
-                throw new DiskException("Не выполнен вход в Яндекс.", DiskErrorKind.Auth);
+            int generation;
+            lock (secrets.Sync)
+            {
+                if (!secrets.SignedIn)
+                    throw new DiskException("Не выполнен вход в Яндекс.", DiskErrorKind.Auth);
+                generation = secrets.Generation;
+            }
             // токен живёт около года; обновляем заранее, за 30 дней до конца
             bool stale = secrets.ExpiresAt is { } exp && exp - DateTime.UtcNow < TimeSpan.FromDays(30);
             if ((force || stale) && !string.IsNullOrEmpty(secrets.RefreshToken) && oauth() is { } o)
@@ -167,10 +176,16 @@ internal sealed class TokenSource(Secrets secrets, Func<YandexOAuth?> oauth, Act
                 try
                 {
                     var t = await o.RefreshAsync(secrets.RefreshToken, ct);
-                    secrets.AccessToken = t.AccessToken;
-                    secrets.RefreshToken = t.RefreshToken ?? secrets.RefreshToken;
-                    secrets.ExpiresAt = t.ExpiresAt;
-                    save();
+                    lock (secrets.Sync)
+                    {
+                        // пока обновляли, пользователь вышел или вошёл заново — его выбор главнее
+                        if (secrets.Generation != generation || !secrets.SignedIn)
+                            throw new DiskException("Вход изменился — повторим.", DiskErrorKind.Transient);
+                        secrets.AccessToken = t.AccessToken;
+                        secrets.RefreshToken = t.RefreshToken ?? secrets.RefreshToken;
+                        secrets.ExpiresAt = t.ExpiresAt;
+                        save();
+                    }
                 }
                 catch (OAuthException e) when (e.Error is "invalid_grant" or "invalid_client" or "unauthorized_client")
                 {
@@ -190,7 +205,11 @@ internal sealed class TokenSource(Secrets secrets, Func<YandexOAuth?> oauth, Act
             {
                 throw new DiskException("Яндекс.Диск не принял вход — войдите заново.", DiskErrorKind.Auth);
             }
-            return secrets.AccessToken!;
+            lock (secrets.Sync)
+            {
+                if (!secrets.SignedIn) throw new DiskException("Не выполнен вход в Яндекс.", DiskErrorKind.Auth);
+                return secrets.AccessToken!;
+            }
         }
         finally { _lock.Release(); }
     }

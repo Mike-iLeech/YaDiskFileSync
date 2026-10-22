@@ -69,6 +69,13 @@ internal sealed class Secrets
 
     public bool SignedIn => !string.IsNullOrEmpty(AccessToken);
 
+    /// <summary>
+    /// Замок и «поколение» входа: вход/выход меняют поколение, и фоновое обновление токена,
+    /// начатое до них, свой результат уже не записывает.
+    /// </summary>
+    [System.Text.Json.Serialization.JsonIgnore] public object Sync { get; } = new();
+    [System.Text.Json.Serialization.JsonIgnore] public int Generation { get; set; }
+
     private static readonly byte[] Entropy = "YaDiskFileSync.v1"u8.ToArray();
     private static string FileName => Path.Combine(Settings.Dir, "secrets.bin");
 

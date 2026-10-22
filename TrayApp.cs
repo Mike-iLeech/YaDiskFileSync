@@ -26,6 +26,7 @@ internal sealed class TrayApp : IDisposable
     private readonly System.Windows.Forms.Timer _updateTimer = new() { Interval = 30_000 };
     private FileWatch? _watch;
     private LoginForm? _login;
+    private bool _choosing;
     private SyncState? _shownProblem;   // о проблеме сообщаем один раз, а не на каждом повторе
     private string? _balloonUrl;
     private ReleaseInfo? _pendingUpdate;
@@ -160,6 +161,14 @@ internal sealed class TrayApp : IDisposable
 
     private void ChooseFile()
     {
+        if (_choosing) return;
+        _choosing = true;
+        try { ChooseFileCore(); }
+        finally { _choosing = false; }
+    }
+
+    private void ChooseFileCore()
+    {
         using var dlg = new OpenFileDialog
         {
             Title = "Какой файл синхронизировать с Яндекс.Диском",
@@ -182,11 +191,15 @@ internal sealed class TrayApp : IDisposable
         {
             if (_login.ShowDialog() != DialogResult.OK || _login.Token is not { } t) return;
             _settings.ClientId = _login.ClientId;
-            _secrets.ClientSecret = _login.ClientSecret.Length > 0 ? _login.ClientSecret : null;
-            _secrets.AccessToken = t.AccessToken;
-            _secrets.RefreshToken = t.RefreshToken;
-            _secrets.ExpiresAt = t.ExpiresAt;
-            SaveSecrets();
+            lock (_secrets.Sync)
+            {
+                _secrets.Generation++;
+                _secrets.ClientSecret = _login.ClientSecret.Length > 0 ? _login.ClientSecret : null;
+                _secrets.AccessToken = t.AccessToken;
+                _secrets.RefreshToken = t.RefreshToken;
+                _secrets.ExpiresAt = t.ExpiresAt;
+                SaveSecrets();
+            }
             _settings.LastUploadedHash = null;   // новый вход (может, другой аккаунт) — загрузить заново
             SaveSettings();
             Balloon("Вход выполнен", "Файл будет загружаться в папку «Приложения» на Яндекс.Диске.", ToolTipIcon.Info);
@@ -204,8 +217,12 @@ internal sealed class TrayApp : IDisposable
     {
         if (MessageBox.Show("Выйти из Яндекса? Файл перестанет загружаться на Диск, пока вы не войдёте снова.",
                 "YaDisk File Sync", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
-        _secrets.ClearTokens();
-        SaveSecrets();
+        lock (_secrets.Sync)
+        {
+            _secrets.Generation++;
+            _secrets.ClearTokens();
+            SaveSecrets();
+        }
         Show(Initial());
     }
 
@@ -250,7 +267,7 @@ internal sealed class TrayApp : IDisposable
         foreach (int n in new[] { 7, 14, 30, 60, 90 })
         {
             int k = n;
-            keep.DropDownItems.Add(new ToolStripMenuItem(k.ToString(), null, (_, _) => { _settings.KeepCopies = k; SaveSettings(); })
+            keep.DropDownItems.Add(new ToolStripMenuItem(k.ToString(), null, (_, _) => SetKeep(k))
             { Checked = k == _settings.KeepCopies });
         }
         _menu.Items.Add(keep);
@@ -288,6 +305,17 @@ internal sealed class TrayApp : IDisposable
                 (_, _) => CheckUpdates(manual: true)) { Enabled = !_updating });
         _menu.Items.Add(new ToolStripSeparator());
         _menu.Items.Add(new ToolStripMenuItem("Выход", null, (_, _) => Exit()));
+    }
+
+    private void SetKeep(int k)
+    {
+        if (k == _settings.KeepCopies) return;
+        if (k < _settings.KeepCopies && MessageBox.Show(
+                $"Хранить {k} копий вместо {_settings.KeepCopies}? При следующей загрузке более старые дневные копии " +
+                "будут удалены с Диска насовсем, мимо Корзины.", "YaDisk File Sync",
+                MessageBoxButtons.OKCancel, MessageBoxIcon.Warning) != DialogResult.OK) return;
+        _settings.KeepCopies = k;
+        SaveSettings();
     }
 
     private static bool SafeAutostart()
