@@ -422,6 +422,60 @@ public class SyncEngineTests : IDisposable
     }
 
     [Fact]
+    public async Task FileRewrittenInPlaceDuringUpload_LatestEditWins()
+    {
+        // программа переписывает файл «на месте», пока мы его читаем: на Диск ушло не то, что считали при обходе.
+        // В базе должно оказаться то, что реально ушло, — иначе следующий проход увидит ложный конфликт,
+        // и более «новая» версия с Диска затрёт последнюю правку
+        Local("a.txt", "v1-old");
+        var e = Engine();
+        await Synced(e);
+        Local("a.txt", "v2-new", Old.AddMinutes(1));
+        _disk.Hook = (op, _) =>
+        {
+            if (op == "upload") WriteInPlace("v3-mid");                        // до чтения: уйдёт v3
+            if (op == "uploaded") Local("a.txt", "v4-last", Old.AddMinutes(2)); // после: последняя правка
+            return null;
+        };
+        await Pass(e);
+        _disk.Hook = null;
+        Assert.Equal("v3-mid", _disk.Text(D("a.txt")));
+        await Synced(e);
+        Assert.Equal("v4-last", _disk.Text(D("a.txt")));
+        Assert.Equal("v4-last", LocalText("a.txt"));
+        Assert.Empty(_trash.Recycled);
+    }
+
+    private void WriteInPlace(string content)
+    {
+        var t = File.GetLastWriteTimeUtc(P("a.txt"));
+        using (var fs = new FileStream(P("a.txt"), FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+            fs.Write(Encoding.UTF8.GetBytes(content));
+        File.SetLastWriteTimeUtc(P("a.txt"), t);
+    }
+
+    [Fact]
+    public async Task HalfWrittenBook_RemoteChanged_NotReplaced()
+    {
+        // книгу ещё пишут (не дописан zip), а на Диске новая версия: ни скачивать поверх, ни загружать половину нельзя
+        var ms = new MemoryStream();
+        using (var z = new ZipArchive(ms, ZipArchiveMode.Create, leaveOpen: true))
+        using (var w = new StreamWriter(z.CreateEntry("xl/sheet.xml").Open())) w.Write(new string('x', 20000));
+        byte[] full = ms.ToArray();
+        File.WriteAllBytes(P("Книга.xlsx"), full);
+        File.SetLastWriteTimeUtc(P("Книга.xlsx"), Old);
+        var e = Engine();
+        await Synced(e);
+        File.WriteAllBytes(P("Книга.xlsx"), full[..(full.Length / 2)]);
+        File.SetLastWriteTimeUtc(P("Книга.xlsx"), Old.AddMinutes(1));
+        _disk.PutFile(D("Книга.xlsx"), "версия с Диска");
+        Assert.Equal(SyncState.Retrying, (await Pass(e)).State);
+        Assert.Equal(full.Length / 2, new FileInfo(P("Книга.xlsx")).Length);
+        Assert.Equal("версия с Диска", _disk.Text(D("Книга.xlsx")));
+        Assert.Empty(_trash.Recycled);
+    }
+
+    [Fact]
     public async Task LocalEditDuringDownload_NotOverwritten()
     {
         Local("a.txt", "v1");

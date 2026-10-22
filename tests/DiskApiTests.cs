@@ -18,7 +18,9 @@ public class DiskApiTests
     {
         var http = new FakeHttp().Reply(HttpStatusCode.OK, Href).Reply(HttpStatusCode.Created);
         long progress = 0;
-        await Client(http, "TOK").UploadAsync("disk:/Папка/Бух учёт.xlsx", new MemoryStream(new byte[] { 1, 2, 3 }), 3, n => progress += n, default);
+        // как в движке: поток без перемотки (HashingStream) — длину HttpClient сам не узнает
+        using var data = new HashingStream(new MemoryStream(new byte[] { 1, 2, 3 }), reading: true);
+        await Client(http, "TOK").UploadAsync("disk:/Папка/Бух учёт.xlsx", data, 3, n => progress += n, default);
 
         Assert.Equal(2, http.Requests.Count);
         var get = http.Requests[0];
