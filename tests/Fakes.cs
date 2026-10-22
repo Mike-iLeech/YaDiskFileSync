@@ -136,7 +136,8 @@ internal sealed class FakeDisk : IDisk
         path = N(path);
         Check("mkdir", path);
         Log.Add("mkdir " + path);
-        if (Items.TryGetValue(path, out var n) && !n.IsDir) throw new DiskException("там файл", DiskErrorKind.Transient);
+        if (Items.TryGetValue(path, out var n) && !n.IsDir)
+            throw new DiskException("там файл", DiskErrorKind.Transient, new DiskClient.HttpConflict("DiskResourceAlreadyExistsError"));
         EnsureParents(path);
         if (!Items.ContainsKey(path)) Items[path] = new Node { IsDir = true, Modified = Tick() };
         return Task.CompletedTask;

@@ -216,7 +216,9 @@ internal sealed class TrayApp : IDisposable
         finally { _asking = false; }
     }
 
-    private void Login()
+    private void Login() => Login(fromSettings: false);
+
+    private void Login(bool fromSettings)
     {
         if (_dialog != null) { _dialog.Activate(); return; }
         using var form = new LoginForm(_http, _settings.ClientId, _secrets.ClientSecret, VerifyAsync, rightsChanged: _needsNewRights);
@@ -250,6 +252,7 @@ internal sealed class TrayApp : IDisposable
             Balloon("Вход выполнен", Configured ? "Синхронизация продолжается." : "Осталось выбрать папки в настройках.", ToolTipIcon.Info);
         }
         finally { _dialog = null; }
+        if (fromSettings) return;   // окно настроек уже открыто — второе не нужно
         if (!Configured) OpenSettings();
         else { Show(Initial()); _engine.Request(); }
     }
@@ -289,7 +292,7 @@ internal sealed class TrayApp : IDisposable
             () =>
             {
                 if (_secrets.SignedIn) Logout();
-                else { var d = _dialog; _dialog = null; try { Login(); } finally { _dialog = d; } }
+                else { var d = _dialog; _dialog = null; try { Login(fromSettings: true); } finally { _dialog = d; } }
             },
             _secrets.SignedIn ? (path, ct) => Disk().ListFoldersAsync(path, ct) : null,
             () => CheckUpdates(manual: true));
@@ -306,7 +309,7 @@ internal sealed class TrayApp : IDisposable
     {
         bool foldersChanged = Configured &&
             (!string.Equals(Path.GetFullPath(_settings.LocalRoot!), c.LocalRoot, StringComparison.OrdinalIgnoreCase) ||
-             !string.Equals(DiskPath.Normalize(_settings.RemoteRoot!), c.RemoteRoot, StringComparison.OrdinalIgnoreCase));
+             !string.Equals(DiskPath.Normalize(_settings.RemoteRoot!), c.RemoteRoot, StringComparison.Ordinal));   // Диск различает регистр
         if (foldersChanged && MessageBox.Show(
                 $"Синхронизировать {c.LocalRoot}\nс папкой Диска {DiskPath.Display(c.RemoteRoot)}?\n\n" +
                 "Содержимое двух папок будет объединено. При совпадении имён побеждает более новая версия, проигравшая уходит " +
@@ -333,9 +336,34 @@ internal sealed class TrayApp : IDisposable
         ApplyExplorer();
         _poll.Interval = (int)Settings.Poll(_settings.PollSeconds).TotalMilliseconds;
         if (scheduleChanged) ScheduleUpdateChecks();
+        OfferLegacyFile();
         Show(Initial());
         Watch();
         _engine.Request();
+    }
+
+    /// <summary>
+    /// Переход с 1.x: та версия следила за одним файлом. Теперь синхронизируется папка — предлагаем положить
+    /// туда копию прежнего файла, иначе он молча перестал бы попадать на Диск.
+    /// </summary>
+    private void OfferLegacyFile()
+    {
+        if (_settings.LegacyFilePath is not { Length: > 0 } old || !Configured) return;
+        string root = _settings.LocalRoot!;
+        _settings.LegacyFilePath = null;
+        SaveSettings();
+        if (!File.Exists(old) || Path.GetFullPath(old).StartsWith(Path.GetFullPath(root) + "\\", StringComparison.OrdinalIgnoreCase)) return;
+        string target = Path.Combine(root, Path.GetFileName(old));
+        if (MessageBox.Show($"Версия 1 загружала на Диск файл\n{old}\n\nТеперь синхронизируется папка {root}. Скопировать файл туда? " +
+                            "Дальше работайте с копией в папке — только она будет попадать на Диск.",
+                "YaDisk File Sync", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        try
+        {
+            if (File.Exists(target)) { MessageBox.Show($"В папке уже есть {Path.GetFileName(old)} — копировать не стал.", "YaDisk File Sync"); return; }
+            File.Copy(old, target);
+            Process.Start("explorer.exe", $"/select,\"{target}\"");
+        }
+        catch (Exception e) { MessageBox.Show("Не удалось скопировать: " + e.Message, "YaDisk File Sync", MessageBoxButtons.OK, MessageBoxIcon.Error); }
     }
 
     /// <summary>Пункт папки в панели навигации Проводника и значок на самой папке.</summary>

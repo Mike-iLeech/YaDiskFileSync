@@ -20,7 +20,7 @@ internal sealed class StateStore(string fileName)
     }
 
     public static string KeyFor(string? uid, string localRoot, string remoteRoot) =>
-        $"{uid}|{Path.GetFullPath(localRoot).TrimEnd('\\').ToUpperInvariant()}|{DiskPath.Normalize(remoteRoot).ToUpperInvariant()}";
+        $"{uid}|{Path.GetFullPath(localRoot).TrimEnd('\\').ToUpperInvariant()}|{DiskPath.Normalize(remoteRoot)}";   // Диск различает регистр, Windows — нет
 
     public Dictionary<string, BaseEntry> Load(string key)
     {
@@ -86,7 +86,15 @@ internal sealed class RecycleBin : ILocalTrash
 /// <summary>Обход локальной папки синхронизации.</summary>
 internal static class LocalScan
 {
-    internal sealed record Result(Dictionary<string, LocalItem> Items, Dictionary<string, string> Busy);
+    /// <summary>Почему путь в этом проходе не трогаем; Retry — временно (занят), иначе — не синхронизируется вовсе.</summary>
+    internal sealed record BusyInfo(string Why, bool Retry);
+
+    /// <summary>Busy с ключом «папка/» закрывает всё, что внутри этой папки.</summary>
+    internal sealed record Result(Dictionary<string, LocalItem> Items, Dictionary<string, BusyInfo> Busy)
+    {
+        public bool IsBusy(string rel) => Busy.ContainsKey(rel) ||
+            Busy.Keys.Any(k => k.EndsWith('/') && rel.StartsWith(k, StringComparison.OrdinalIgnoreCase));
+    }
 
     /// <summary>Сколько файл с именем как у временного файла Excel считается временным.</summary>
     internal static readonly TimeSpan ExcelTempAge = TimeSpan.FromMinutes(2);
@@ -100,7 +108,7 @@ internal static class LocalScan
     {
         DateTime now = nowUtc ?? DateTime.UtcNow;
         var items = new Dictionary<string, LocalItem>(Planner.Paths);
-        var busy = new Dictionary<string, string>(Planner.Paths);
+        var busy = new Dictionary<string, BusyInfo>(Planner.Paths);
         var stack = new Stack<(string Dir, string Rel)>();
         stack.Push((root, ""));
         while (stack.Count > 0)
@@ -110,9 +118,17 @@ internal static class LocalScan
             foreach (var info in new DirectoryInfo(dir).EnumerateFileSystemInfos())
             {
                 if (Ignore.Name(info.Name)) continue;
-                // ссылки и точки соединения не обходим: могут вести по кругу или за пределы папки
-                if ((info.Attributes & FileAttributes.ReparsePoint) != 0) continue;
                 string rel = relDir.Length == 0 ? info.Name : relDir + "/" + info.Name;
+                // ссылки, точки соединения и файлы «по запросу» (OneDrive) не обходим: могут вести по кругу,
+                // за пределы папки или скачиваться при чтении. Но и удалёнными их не считаем — то, что было
+                // синхронизировано под этим именем, на Диске не трогаем
+                if ((info.Attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    var why = new BusyInfo("ссылка или файл «по запросу» — не синхронизируется", false);
+                    busy[rel] = why;
+                    if (info is DirectoryInfo) busy[rel + "/"] = why;
+                    continue;
+                }
                 if (info is DirectoryInfo)
                 {
                     items[rel] = new LocalItem(rel, true, 0, default, null);
@@ -124,15 +140,17 @@ internal static class LocalScan
                 DateTime mtime = fi.LastWriteTimeUtc;
                 string? sha = null;
                 if (Ignore.LooksLikeExcelTemp(info.Name) && now - mtime < ExcelTempAge)
-                    busy[rel] = "временный файл Excel — подожду";   // скорее всего, его сейчас переименуют в книгу
+                    busy[rel] = new BusyInfo("временный файл Excel — подожду", false);   // скорее всего, его сейчас переименуют в книгу
                 else if (baseState.TryGetValue(rel, out var b) && !b.IsDir && b.Size == size && b.LocalMtime == mtime)
                     sha = b.Sha256;   // не менялся с последней синхронизации
                 else
                 {
-                    try { sha = HashStable(fi.FullName, size, mtime); }
+                    // «недописанность» проверяем только у свежих файлов: старый битый или пустой (Проводник → Создать)
+                    // документ — это уже его содержимое, синхронизируем как есть
+                    try { sha = HashStable(fi.FullName, size, mtime, checkBook: now - mtime < ExcelTempAge); }
                     catch (Exception e) when (e is IOException or UnauthorizedAccessException)
                     {
-                        busy[rel] = e is UnauthorizedAccessException ? "нет доступа к файлу" : "файл занят или ещё сохраняется";
+                        busy[rel] = new BusyInfo(e is UnauthorizedAccessException ? "нет доступа к файлу" : "файл занят или ещё сохраняется", true);
                     }
                 }
                 items[rel] = new LocalItem(rel, false, size, mtime, sha);
@@ -142,14 +160,14 @@ internal static class LocalScan
     }
 
     /// <summary>SHA-256 файла; файл должен не меняться во время чтения, а книга Excel — быть дописанной.</summary>
-    internal static string HashStable(string path, long size, DateTime mtime)
+    internal static string HashStable(string path, long size, DateTime mtime, bool checkBook = true)
     {
         using var fs = OpenShared(path);
         if (fs.Length != size) throw new IOException("файл менялся во время чтения");
         string sha = Convert.ToHexString(SHA256.HashData(fs));
         var after = new FileInfo(path);
         if (after.Length != size || after.LastWriteTimeUtc != mtime) throw new IOException("файл менялся во время чтения");
-        if (IsZipBook(path))
+        if (checkBook && IsZipBook(path))
         {
             fs.Position = 0;
             if (!IsCompleteBook(fs)) throw new IOException("книга записана не полностью");

@@ -122,6 +122,17 @@ internal static class Planner
     private static void PlanFile(List<SyncOp> ops, string rel, BaseEntry? b, LocalItem? l, RemoteItem? r, DateTime now)
     {
         bool lChanged = l != null && (b == null || !SameHash(l.Sha256, b.Sha256));
+
+        // загрузка отправлена, но Диск мог её ещё не применить (ответ 202): файла там ещё нет или там прежняя версия.
+        // Это не «удалён на Диске» и не «изменён на Диске»; не применилась за UploadSettle — загружаем снова
+        if (b?.PendingUntil != null && l != null && (r == null || (b.PrevRemoteSha != null && SameHash(r.Sha256, b.PrevRemoteSha))))
+        {
+            if (lChanged || b.PendingUntil <= now)
+                ops.Add(new SyncOp(OpKind.Upload, rel, false, lChanged ? "изменён на компьютере" : "Диск не применил загрузку — загружаю снова")
+                    { Local = l, Remote = r });
+            return;
+        }
+
         bool rChanged = r != null && (b == null || RemoteDiffers(r, b, now));
 
         if (l != null && r != null)
@@ -130,7 +141,7 @@ internal static class Planner
             {
                 // база уже такая — делать нечего; иначе (первая встреча, «потрогали» файл) обновляем её
                 if (b == null || !SameHash(b.Sha256, l.Sha256) || b.Size != l.Size || b.LocalMtime != l.Mtime || b.RemoteModified != r.Modified ||
-                    b.PrevRemoteSha != null)
+                    b.PendingUntil != null)
                     ops.Add(new SyncOp(OpKind.Record, rel, false, "совпадает") { Local = l, Remote = r });
             }
             else if (!lChanged && !rChanged)
@@ -138,7 +149,9 @@ internal static class Planner
             else if (lChanged && !rChanged)
                 ops.Add(new SyncOp(OpKind.Upload, rel, false, b == null ? "новый на компьютере" : "изменён на компьютере") { Local = l, Remote = r });
             else if (!lChanged && rChanged)
-                ops.Add(new SyncOp(OpKind.Download, rel, false, "изменён на Диске") { Local = l, Remote = r });
+                // если наша загрузка ещё не подтвердилась, локальная версия может быть только здесь — её в Корзину, а не в никуда
+                ops.Add(new SyncOp(OpKind.Download, rel, false, "изменён на Диске", ReplacesLocalChanges: b?.PendingUntil != null)
+                    { Local = l, Remote = r });
             else if (LocalIsNewer(l, r))
                 ops.Add(new SyncOp(OpKind.Upload, rel, false, "изменён с обеих сторон, на компьютере новее", ReplacesRemoteChanges: true)
                     { Local = l, Remote = r });

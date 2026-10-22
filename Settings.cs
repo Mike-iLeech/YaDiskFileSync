@@ -24,6 +24,9 @@ internal sealed class Settings
     /// <summary>Показывать папку в панели навигации Проводника.</summary>
     public bool ShowInExplorer { get; set; } = true;
     public DateTime? LastSyncedAt { get; set; }
+    /// <summary>Файл, который синхронизировала версия 1.x (поле FilePath её настроек) — чтобы подсказать, куда его деть.</summary>
+    [System.Text.Json.Serialization.JsonPropertyName("FilePath")]
+    public string? LegacyFilePath { get; set; }
 
     public bool AutoUpdate { get; set; } = true;
     /// <summary>Как часто проверять обновления, в часах; 0 — не проверять.</summary>

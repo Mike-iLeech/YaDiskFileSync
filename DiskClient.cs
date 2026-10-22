@@ -399,13 +399,13 @@ internal static class DiskPath
 {
     /// <summary>
     /// Путь, введённый человеком (настройки): «/Папка», «Папка/», «disk:/Папка» → «disk:/Папка»; корень — «disk:/».
-    /// Пробелы по краям частей обрезаются — поэтому только для ввода, а не для путей файлов: « a.txt» и «a.txt» — разные файлы.
+    /// Обрезаются только пробелы по краям всей строки, имена частей остаются как есть («/Папка /x» ≠ «/Папка/x»).
     /// </summary>
     public static string Normalize(string path)
     {
         string p = path.Trim().Replace('\\', '/');
         if (p.StartsWith("disk:", StringComparison.OrdinalIgnoreCase)) p = p[5..];
-        var parts = p.Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var parts = p.Split('/', StringSplitOptions.RemoveEmptyEntries);
         return "disk:/" + string.Join('/', parts);
     }
 

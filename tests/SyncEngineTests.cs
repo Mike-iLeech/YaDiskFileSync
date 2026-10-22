@@ -121,6 +121,7 @@ public class SyncEngineTests : IDisposable
         Local("a.txt", "v1");
         var e = Engine();
         await Synced(e);
+        await Synced(e);   // следующий опрос: Диск показал загруженное — ожидание снято
         _disk.PutFile(D("a.txt"), "v2");
         await Synced(e);
         Assert.Equal("v2", LocalText("a.txt"));
@@ -180,6 +181,7 @@ public class SyncEngineTests : IDisposable
         Local("c.txt", "3");
         var e = Engine();
         await Synced(e);
+        await Synced(e);   // следующий опрос: Диск показал загруженное — ожидание снято
         await _disk.DeleteAsync(D("a.txt"), default);
         await Synced(e);
         Assert.False(File.Exists(P("a.txt")));
@@ -224,6 +226,7 @@ public class SyncEngineTests : IDisposable
         Local("d.txt", "4");
         var e = Engine();
         await Synced(e);
+        await Synced(e);   // следующий опрос: Диск показал загруженное — ожидание снято
         await _disk.DeleteAsync(D("Папка"), default);
         await Synced(e);
         Assert.False(Directory.Exists(P("Папка")));
@@ -237,6 +240,7 @@ public class SyncEngineTests : IDisposable
         foreach (var n in new[] { "a", "b", "c", "d" }) Local(n + ".txt", n);
         var e = Engine();
         await Synced(e);
+        await Synced(e);   // следующий опрос: Диск показал загруженное — ожидание снято
         return e;
     }
 
@@ -467,7 +471,7 @@ public class SyncEngineTests : IDisposable
         var e = Engine();
         await Synced(e);
         File.WriteAllBytes(P("Книга.xlsx"), full[..(full.Length / 2)]);
-        File.SetLastWriteTimeUtc(P("Книга.xlsx"), Old.AddMinutes(1));
+        File.SetLastWriteTimeUtc(P("Книга.xlsx"), DateTime.UtcNow);   // пишется прямо сейчас
         _disk.PutFile(D("Книга.xlsx"), "версия с Диска");
         Assert.Equal(SyncState.Retrying, (await Pass(e)).State);
         Assert.Equal(full.Length / 2, new FileInfo(P("Книга.xlsx")).Length);

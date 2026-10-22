@@ -236,11 +236,23 @@ internal sealed class SyncEngine : IDisposable
             { return Say(SyncState.Retrying, "Не удалось прочитать папку: " + e.Message); }
 
             var plan = Planner.Plan(baseState, scan.Items, remote);
+            // пропущенный путь (здесь папка, там файл) закрывает и всё, что внутри него
+            var skipDirs = plan.Ops.Where(o => o.Kind == OpKind.Skip).Select(o => o.Rel + "/").ToList();
+            // Excel посреди сохранения: книги на миг нет, есть свежий временный файл — удаления в этой папке откладываем
+            var savingDirs = scan.Busy.Where(b => !b.Value.Retry && Ignore.LooksLikeExcelTemp(b.Key.Split('/')[^1]))
+                .Select(b => b.Key.Contains('/') ? b.Key[..b.Key.LastIndexOf('/')] : "").ToHashSet(Planner.Paths);
             var ops = new List<SyncOp>();
             foreach (var o in plan.Ops)
             {
                 // с занятыми и пропущенными файлами в этом проходе ничего не делаем
-                if (scan.Busy.ContainsKey(o.Rel) || skipped.ContainsKey(o.Rel)) continue;
+                if (scan.IsBusy(o.Rel) || skipped.ContainsKey(o.Rel)) continue;
+                if (skipDirs.Any(d => o.Rel.StartsWith(d, StringComparison.OrdinalIgnoreCase)))
+                {
+                    skipped[o.Rel] = "внутри пути, где на компьютере папка, а на Диске файл (или наоборот)";
+                    continue;
+                }
+                if (o.Kind == OpKind.DeleteRemote && !o.IsDir &&
+                    savingDirs.Contains(o.Rel.Contains('/') ? o.Rel[..o.Rel.LastIndexOf('/')] : "")) continue;
                 // папку на Диске с несинхронизируемым содержимым целиком в Корзину не отправляем — только забываем
                 if (o.Kind == OpKind.DeleteRemote && o.IsDir &&
                     unsynced.Any(u => u.StartsWith(o.Rel + "/", StringComparison.OrdinalIgnoreCase)))
@@ -325,7 +337,7 @@ internal sealed class SyncEngine : IDisposable
 
     private async Task<SyncStatus> ExecuteAsync(IDisk disk, string key, string localRoot, string remoteRoot, bool remoteMissing,
         Dictionary<string, RemoteItem> remote, Dictionary<string, BaseEntry> baseState, List<SyncOp> ops,
-        IReadOnlyDictionary<string, string> busy, IReadOnlyDictionary<string, string> skippedRemote, CancellationToken ct)
+        IReadOnlyDictionary<string, LocalScan.BusyInfo> busy, IReadOnlyDictionary<string, string> skippedRemote, CancellationToken ct)
     {
         // порядок: папки (сверху вниз) → передачи → удаление файлов → удаление папок (снизу вверх)
         static int Rank(SyncOp o) => o.Kind switch
@@ -340,7 +352,9 @@ internal sealed class SyncEngine : IDisposable
         var acts = ops.Where(o => o.Kind is not (OpKind.Record or OpKind.Forget))
                       .Select(o => new Activity(o.Rel, o.Kind, o.IsDir ? 0 : o.Kind == OpKind.Download ? o.Remote?.Size ?? 0 : o.Local?.Size ?? 0))
                       .ToList();
-        foreach (var (rel, why) in busy) acts.Add(new Activity(rel, OpKind.Skip, 0) { State = RowState.Failed, Error = why });
+        foreach (var (rel, why) in busy)
+            if (!rel.EndsWith('/'))
+                acts.Add(new Activity(rel, OpKind.Skip, 0) { State = why.Retry ? RowState.Failed : RowState.Queued, Error = why.Why });
         foreach (var (rel, why) in skippedRemote) acts.Add(new Activity(rel, OpKind.Skip, 0) { State = RowState.Failed, Error = why });
         SetActivity(acts, baseState);
         var actByOp = new Dictionary<SyncOp, Activity>();
@@ -350,7 +364,7 @@ internal sealed class SyncEngine : IDisposable
         var pass = new PassContext(localRoot, remoteRoot, remote.Values);
         if (remoteMissing) await disk.EnsureFolderAsync(remoteRoot, ct);
 
-        int failed = 0, retry = busy.Count(b => !b.Value.StartsWith("временный файл Excel"));
+        int failed = 0, retry = busy.Count(b => b.Value.Retry);
         bool again = false;
         string? firstError = null, firstAgain = null;
         int sinceSave = 0;
@@ -377,6 +391,13 @@ internal sealed class SyncEngine : IDisposable
                 }
                 catch (DiskException e) when (e.Kind == DiskErrorKind.Fatal)
                 {
+                    failed++;
+                    firstError ??= $"{op.Rel}: {e.Message}";
+                    if (act != null) { act.State = RowState.Failed; act.Error = e.Message; }
+                }
+                catch (DiskException e) when (e.InnerException is DiskClient.HttpConflict)
+                {
+                    // конфликт по одному пути (там файл вместо папки и т.п.) — это проблема файла, а не всего прохода
                     failed++;
                     firstError ??= $"{op.Rel}: {e.Message}";
                     if (act != null) { act.State = RowState.Failed; act.Error = e.Message; }
@@ -572,7 +593,8 @@ internal sealed class SyncEngine : IDisposable
         baseState[op.Rel] = new BaseEntry
         {
             Sha256 = sent, Size = hashing.Count, LocalMtime = l.Mtime, RemoteModified = null,
-            PrevRemoteSha = op.Remote?.Sha256, PendingUntil = op.Remote?.Sha256 != null ? DateTime.UtcNow + UploadSettle : null,
+            // и новый файл, и новая версия: пока Диск не покажет отправленное, его отсутствие или прежняя версия — не изменение там
+            PrevRemoteSha = op.Remote?.Sha256, PendingUntil = DateTime.UtcNow + UploadSettle,
         };
         return Planner.SameHash(sent, l.Sha256) && SameAsScanned(full, l) ? Outcome.Done : Outcome.Changed;
     }
