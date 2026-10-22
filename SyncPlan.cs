@@ -18,6 +18,8 @@ internal sealed class BaseEntry
     /// (PrevRemoteSha) в списке Диска — не «изменение на Диске», а ещё не применённая загрузка.
     /// </summary>
     public string? PrevRemoteSha { get; set; }
+    /// <summary>Время прежней версии на Диске: если sha256 нет, по нему отличаем свою загрузку от прежней версии того же размера.</summary>
+    public DateTime? PrevRemoteModified { get; set; }
     public DateTime? PendingUntil { get; set; }
 }
 
@@ -134,7 +136,8 @@ internal static class Planner
         }
 
         // Диск показал файл без sha256, но нужного размера — считаем загрузку применённой, иначе ожидание не снимется никогда
-        if (b?.PendingUntil != null && l != null && r != null && r.Sha256 == null && r.Size == b.Size && !lChanged)
+        if (b?.PendingUntil != null && l != null && r != null && r.Sha256 == null && r.Size == b.Size && !lChanged &&
+            (b.PrevRemoteModified == null || r.Modified != b.PrevRemoteModified))
         {
             ops.Add(new SyncOp(OpKind.Record, rel, false, "загрузка подтверждена") { Local = l, Remote = r });
             return;

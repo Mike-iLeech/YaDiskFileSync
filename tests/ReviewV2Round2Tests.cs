@@ -233,6 +233,37 @@ public class ReviewV2Round2Tests : IDisposable
     }
 
     [Fact]
+    public async Task R4M1_PartlyDeferredMassDeletion_StillAsks()
+    {
+        // пропало 6 из 10, два из них — в папке, где Excel прямо сейчас сохраняет: всё равно массовое удаление
+        foreach (var n in new[] { "a", "b", "c", "d" }) Local(n + ".txt", n);
+        foreach (var n in new[] { "e", "f", "g", "h" }) Local(n + ".txt", n);
+        Local("x/1.txt", "1");
+        Local("x/2.txt", "2");
+        var e = Engine();
+        await Synced(e);
+        await Synced(e);
+        foreach (var n in new[] { "a", "b", "c", "d" }) File.Delete(P(n + ".txt"));
+        File.Delete(P("x/1.txt"));
+        File.Delete(P("x/2.txt"));
+        Local("x/5F3A2B10", "сохранение", DateTime.UtcNow);
+        var s = await e.RunOnceAsync(default);
+        Assert.Equal(SyncState.NeedsConfirm, s.State);
+        Assert.Empty(_disk.Trash);
+    }
+
+    [Fact]
+    public void R4L1_NoShaSameSize_ButStillPreviousVersion_NotConfirmed()
+    {
+        var b = new Dictionary<string, BaseEntry>(Planner.Paths)
+        {
+            ["f"] = new BaseEntry { Sha256 = "NEW", Size = 1, LocalMtime = T0, PendingUntil = T0.AddMinutes(3), PrevRemoteModified = T0.AddMinutes(-30) },
+        };
+        var plan = Planner.Plan(b, L(), new Dictionary<string, RemoteItem>(Planner.Paths) { ["f"] = new RemoteItem("f", false, 1, null, T0.AddMinutes(-30)) }, T0);
+        Assert.DoesNotContain(plan.Ops, o => o.Kind == OpKind.Record);
+    }
+
+    [Fact]
     public void R3M2_SettleWindowShort() => Assert.True(SyncEngine.UploadSettle <= TimeSpan.FromMinutes(3));
 
     // ---------- L-3: Excel посреди сохранения ----------

@@ -263,10 +263,11 @@ internal sealed class SyncEngine : IDisposable
                 ops.Add(o);
             }
 
-            // спрашиваем только про то, что действительно будет удалено (без отложенного и пропущенного выше),
+            // «массово или нет» — по полному плану (отложенное удаление тоже пропажа: иначе больше половины ушло бы
+            // по частям без вопроса); но спрашиваем только про то, что удалится сейчас, и только если такое есть —
             // иначе вопрос повторялся бы каждый опрос, хотя «Да» ничего не удаляет
             var toRun = new SyncPlan(ops, plan.BaseFiles);
-            if (toRun.NeedsConfirmation(remoteMissing))
+            if ((plan.NeedsConfirmation(remoteMissing) || toRun.NeedsConfirmation(remoteMissing)) && toRun.DeletionKeys.Count > 0)
             {
                 IReadOnlySet<string>? allowed;
                 lock (_gate) allowed = _allowedDeletes;
@@ -597,7 +598,7 @@ internal sealed class SyncEngine : IDisposable
         {
             Sha256 = sent, Size = hashing.Count, LocalMtime = l.Mtime, RemoteModified = null,
             // и новый файл, и новая версия: пока Диск не покажет отправленное, его отсутствие или прежняя версия — не изменение там
-            PrevRemoteSha = op.Remote?.Sha256, PendingUntil = DateTime.UtcNow + UploadSettle,
+            PrevRemoteSha = op.Remote?.Sha256, PrevRemoteModified = op.Remote?.Modified, PendingUntil = DateTime.UtcNow + UploadSettle,
         };
         return Planner.SameHash(sent, l.Sha256) && SameAsScanned(full, l) ? Outcome.Done : Outcome.Changed;
     }
