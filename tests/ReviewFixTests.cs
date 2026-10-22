@@ -41,6 +41,33 @@ public class ReviewFixTests : IDisposable
         Assert.False(SyncEngine.IsCompleteZip(cut));
     }
 
+    /// <summary>Заголовок OLE/CFB, как у книги, зашифрованной паролем (EncryptedPackage).</summary>
+    private static byte[] Cfb(int length)
+    {
+        var b = new byte[length];
+        new byte[] { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 }.CopyTo(b, 0);
+        return b;
+    }
+
+    [Fact]
+    public void PasswordProtectedBook_Accepted() => Assert.True(SyncEngine.IsCompleteBook(Cfb(512 * 40)));
+
+    [Theory]
+    [InlineData(512 * 40 - 100)]   // оборван посреди сектора
+    [InlineData(512)]              // один заголовок без данных
+    public void PasswordProtectedBook_Truncated_Rejected(int length) => Assert.False(SyncEngine.IsCompleteBook(Cfb(length)));
+
+    [Fact]
+    public async Task PasswordProtectedXlsx_Uploaded()
+    {
+        string p = Path.Combine(_dir, "Бухгалтерия.xlsx");
+        File.WriteAllBytes(p, Cfb(512 * 40));
+        var disk = new FakeDisk();
+        var e = new SyncEngine(() => disk, new Settings { FilePath = p }, () => { }, null, (_, _) => Task.CompletedTask) { ReadAttempts = 2, ReadRetryPause = TimeSpan.Zero };
+        Assert.Equal(SyncState.Synced, (await e.RunOnceAsync(default)).State);
+        Assert.True(disk.Files.ContainsKey("app:/Бухгалтерия.xlsx"));
+    }
+
     [Fact]
     public async Task TruncatedXlsx_NotUploaded()
     {

@@ -90,6 +90,8 @@ internal sealed class SyncEngine : IDisposable
             if (!run) continue;
 
             _retry?.Cancel();
+            _retry?.Dispose();
+            _retry = null;
             SyncStatus result;
             try { result = await RunOnceAsync(ct); }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { return; }
@@ -200,7 +202,7 @@ internal sealed class SyncEngine : IDisposable
                 var after = new FileInfo(path);
                 if (after.Length != len || after.LastWriteTimeUtc != mtime || data.Length != len)
                     throw new IOException("файл менялся во время чтения");
-                if (IsZipBook(path) && !IsCompleteZip(data))
+                if (IsZipBook(path) && !IsCompleteBook(data))
                     throw new IOException("файл записан не полностью");
                 return new FileSnapshot(data, Convert.ToHexString(SHA256.HashData(data)));
             }
@@ -213,6 +215,20 @@ internal sealed class SyncEngine : IDisposable
 
     private static bool IsZipBook(string path) =>
         Path.GetExtension(path).ToLowerInvariant() is ".xlsx" or ".xlsm" or ".xlsb" or ".xltx" or ".xltm";
+
+    private static readonly byte[] CfbSignature = { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
+
+    /// <summary>
+    /// Книга целая? Обычная книга — zip. Книга с паролем («Зашифровать с паролем») — контейнер OLE
+    /// с той же сигнатурой, что у старого .xls, хотя расширение .xlsx: его содержимое не проверить,
+    /// но Excel пишет его так же через временный файл; проверяем хотя бы целое число секторов.
+    /// </summary>
+    internal static bool IsCompleteBook(byte[] data)
+    {
+        if (data.Length >= CfbSignature.Length && data.AsSpan(0, CfbSignature.Length).SequenceEqual(CfbSignature))
+            return data.Length >= 1024 && data.Length % 512 == 0;
+        return IsCompleteZip(data);
+    }
 
     /// <summary>
     /// Zip пишется с начала, а оглавление — в самом конце: недописанный архив открыть не получится.
