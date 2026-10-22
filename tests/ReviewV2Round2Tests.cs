@@ -253,6 +253,42 @@ public class ReviewV2Round2Tests : IDisposable
     }
 
     [Fact]
+    public async Task R5M1_PartlyDeferredMassDeletion_RestoreBringsBackAll()
+    {
+        foreach (var n in new[] { "a", "b", "c", "d" }) Local(n + ".txt", n);
+        foreach (var n in new[] { "e", "f", "g", "h" }) Local(n + ".txt", n);
+        Local("x/1.txt", "1");
+        Local("x/2.txt", "2");
+        var e = Engine();
+        await Synced(e);
+        await Synced(e);
+        foreach (var n in new[] { "a", "b", "c", "d" }) File.Delete(P(n + ".txt"));
+        File.Delete(P("x/1.txt"));
+        File.Delete(P("x/2.txt"));
+        Local("x/5F3A2B10", "сохранение", DateTime.UtcNow);
+        Assert.Equal(SyncState.NeedsConfirm, (await e.RunOnceAsync(default)).State);
+        Assert.Equal(6, e.Question!.RemoteDeletes);
+        e.Resolve(e.Question!, delete: false);
+        await e.RunOnceAsync(default);
+        File.SetLastWriteTimeUtc(P("x/5F3A2B10"), Old);   // сохранение «закончилось» — отложенное больше не отложено
+        await e.RunOnceAsync(default);
+        Assert.Empty(_disk.Trash);
+        Assert.Equal("1", LocalText("x/1.txt"));
+        Assert.Equal("a", LocalText("a.txt"));
+    }
+
+    [Fact]
+    public void R5L1_NoShaPreviousVersion_SettleExpired_Reuploads()
+    {
+        var b = new Dictionary<string, BaseEntry>(Planner.Paths)
+        {
+            ["f"] = new BaseEntry { Sha256 = "NEW", Size = 1, LocalMtime = T0, PendingUntil = T0.AddMinutes(-1), PrevRemoteModified = T0.AddMinutes(-30) },
+        };
+        var plan = Planner.Plan(b, L(), new Dictionary<string, RemoteItem>(Planner.Paths) { ["f"] = new RemoteItem("f", false, 1, null, T0.AddMinutes(-30)) }, T0);
+        Assert.Equal(OpKind.Upload, Assert.Single(plan.Ops).Kind);
+    }
+
+    [Fact]
     public void R4L1_NoShaSameSize_ButStillPreviousVersion_NotConfirmed()
     {
         var b = new Dictionary<string, BaseEntry>(Planner.Paths)

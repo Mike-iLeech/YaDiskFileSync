@@ -127,7 +127,9 @@ internal static class Planner
 
         // загрузка отправлена, но Диск мог её ещё не применить (ответ 202): файла там ещё нет или там прежняя версия.
         // Это не «удалён на Диске» и не «изменён на Диске»; не применилась за UploadSettle — загружаем снова
-        if (b?.PendingUntil != null && l != null && (r == null || (b.PrevRemoteSha != null && SameHash(r.Sha256, b.PrevRemoteSha))))
+        if (b?.PendingUntil != null && l != null && (r == null || (b.PrevRemoteSha != null && SameHash(r.Sha256, b.PrevRemoteSha)) ||
+                                                     // прежняя версия без sha256 — узнаём её по времени
+                                                     (r.Sha256 == null && b.PrevRemoteSha == null && b.PrevRemoteModified != null && r.Modified == b.PrevRemoteModified)))
         {
             if (lChanged || b.PendingUntil <= now)
                 ops.Add(new SyncOp(OpKind.Upload, rel, false, lChanged ? "изменён на компьютере" : "Диск не применил загрузку — загружаю снова")

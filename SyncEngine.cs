@@ -271,11 +271,11 @@ internal sealed class SyncEngine : IDisposable
             {
                 IReadOnlySet<string>? allowed;
                 lock (_gate) allowed = _allowedDeletes;
-                var keys = toRun.DeletionKeys;
-                if (allowed == null || !keys.IsSubsetOf(allowed))
+                if (allowed == null || !toRun.DeletionKeys.IsSubsetOf(allowed))
                 {
-                    var samples = ops.Where(o => o.Kind is OpKind.DeleteLocal or OpKind.DeleteRemote && !o.IsDir).Select(o => o.Rel).Take(10).ToList();
-                    Question = new DeletionQuestion(toRun.LocalDeletes, toRun.RemoteDeletes, toRun.BaseFiles, remoteMissing, samples, keys);
+                    // вопрос — про всё пропавшее, включая отложенное: «вернуть» должно вернуть всё, а «удалить» разрешает всё
+                    var samples = plan.Ops.Where(o => o.Kind is OpKind.DeleteLocal or OpKind.DeleteRemote && !o.IsDir).Select(o => o.Rel).Take(10).ToList();
+                    Question = new DeletionQuestion(plan.LocalDeletes, plan.RemoteDeletes, plan.BaseFiles, remoteMissing, samples, plan.DeletionKeys);
                     SetActivity(new List<Activity>(), baseState);
                     return Say(SyncState.NeedsConfirm, Explain(Question));
                 }
